@@ -25,6 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --release -- -D warnings
       - run: cargo test --release
+      # Clippy and tests don't produce the binary the smoke test runs.
+      - run: cargo build --release
       # The TUI needs a real terminal, but the daemon can be exercised headless.
       - name: Daemon smoke test
         env:
