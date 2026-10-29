@@ -1,0 +1,22 @@
+# systemd user unit for the pmon history daemon.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/pmon.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pmon.service
+#
+# Adjust ExecStart if pmon is not in ~/.cargo/bin.
+
+[Unit]
+Description=pmon CPU/RAM history sampler
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/pmon --daemon --foreground --retain 1h
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
