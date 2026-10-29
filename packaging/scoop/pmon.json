@@ -1,18 +1,18 @@
 {
-    "version": "0.1.0",
+    "version": "0.1.1",
     "description": "Minimal terminal CPU / RAM monitor with an optional history daemon",
     "homepage": "https://github.com/rpattn/pmon",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip",
-            "hash": "f21c651b42ba071981a016abc1c90921ddf47d4ed40282bb18007c1497727ed3",
-            "extract_dir": "pmon-v0.1.0-x86_64-pc-windows-msvc"
+            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.1/pmon-v0.1.1-x86_64-pc-windows-msvc.zip",
+            "hash": "9b211146fb44573ad0e3cd3f62558793e0762692d5ce699c3969625cdc914dbe",
+            "extract_dir": "pmon-v0.1.1-x86_64-pc-windows-msvc"
         },
         "arm64": {
-            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-aarch64-pc-windows-msvc.zip",
-            "hash": "0354fbef07064ff99459ff37305e66fb1f3c11fa1dd9e8c8a75e3e1ef8a0d59e",
-            "extract_dir": "pmon-v0.1.0-aarch64-pc-windows-msvc"
+            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.1/pmon-v0.1.1-aarch64-pc-windows-msvc.zip",
+            "hash": "e8867910742551299d4982d312a70891a9efb47d6fe67ec749f3b3aada7613b5",
+            "extract_dir": "pmon-v0.1.1-aarch64-pc-windows-msvc"
         }
     },
     "bin": "pmon.exe",
