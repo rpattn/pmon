@@ -22,18 +22,74 @@ use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 pub const SYS_FILE: &str = "system.ring";
 pub const PROC_FILE: &str = "procs.ring";
 
 const MAGIC: &[u8; 8] = b"PMONRING";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_LEN: u64 = 64;
 const OFF_BEGIN: u64 = 24;
 
+/// Positional reads and writes that don't touch a shared file cursor.
+#[cfg(unix)]
+mod pio {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::fs::FileExt;
+
+    pub fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+        f.read_exact_at(buf, off)
+    }
+    pub fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+        f.write_all_at(buf, off)
+    }
+}
+
+#[cfg(windows)]
+mod pio {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::fs::FileExt;
+
+    pub fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match f.seek_read(buf, off)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => {
+                    buf = &mut buf[n..];
+                    off += n as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match f.seek_write(buf, off)? {
+                0 => return Err(io::ErrorKind::WriteZero.into()),
+                n => {
+                    buf = &buf[n..];
+                    off += n as u64;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+use pio::{read_exact_at, write_all_at};
+
+/// `%LOCALAPPDATA%\pmon` on Windows.
+#[cfg(windows)]
+pub fn state_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join("pmon")
+}
+
 /// `$XDG_STATE_HOME/pmon`, falling back to `~/.local/state/pmon`.
+#[cfg(not(windows))]
 pub fn state_dir() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -71,7 +127,7 @@ pub struct ProcRec {
     pub pid: u32,
     /// Percent of one core (top-style; may exceed 100).
     pub cpu: f32,
-    pub name: [u8; 16],
+    pub name: [u8; 32],
 }
 
 impl ProcRec {
@@ -82,7 +138,7 @@ impl ProcRec {
 
     pub fn set_name(&mut self, name: &[u8]) {
         let n = name.len().min(self.name.len());
-        self.name = [0; 16];
+        self.name = [0; 32];
         self.name[..n].copy_from_slice(&name[..n]);
     }
 }
@@ -115,14 +171,14 @@ impl Record for SysRec {
 }
 
 impl Record for ProcRec {
-    const SIZE: usize = 48;
+    const SIZE: usize = 64;
     fn encode(&self, o: &mut [u8]) {
         o[0..8].copy_from_slice(&self.ts_ms.to_le_bytes());
         o[8..16].copy_from_slice(&self.start_time.to_le_bytes());
         o[16..24].copy_from_slice(&self.rss.to_le_bytes());
         o[24..28].copy_from_slice(&self.pid.to_le_bytes());
         o[28..32].copy_from_slice(&self.cpu.to_le_bytes());
-        o[32..48].copy_from_slice(&self.name);
+        o[32..64].copy_from_slice(&self.name);
     }
     fn decode(b: &[u8]) -> Self {
         ProcRec {
@@ -131,7 +187,7 @@ impl Record for ProcRec {
             rss: u64_at(b, 16),
             pid: u32_at(b, 24),
             cpu: f32_at(b, 28),
-            name: b[32..48].try_into().unwrap(),
+            name: b[32..64].try_into().unwrap(),
         }
     }
     fn ts_ms(&self) -> u64 {
@@ -149,7 +205,7 @@ struct Header {
 
 fn read_header(file: &File) -> io::Result<Option<Header>> {
     let mut b = [0u8; HEADER_LEN as usize];
-    match file.read_exact_at(&mut b, 0) {
+    match read_exact_at(file, &mut b, 0) {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         r => r?,
     }
@@ -204,7 +260,7 @@ impl<R: Record> Ring<R> {
         b[12..16].copy_from_slice(&(R::SIZE as u32).to_le_bytes());
         b[16..24].copy_from_slice(&cap.to_le_bytes());
         b[40..44].copy_from_slice(&interval_ms.to_le_bytes());
-        file.write_all_at(&b, 0)?;
+        write_all_at(&file, &b, 0)?;
         Ok(Ring { file, cap, end: 0, interval_ms, _r: PhantomData })
     }
 
@@ -234,7 +290,7 @@ impl<R: Record> Ring<R> {
 
     fn counts(&self) -> io::Result<(u64, u64)> {
         let mut b = [0u8; 16];
-        self.file.read_exact_at(&mut b, OFF_BEGIN)?;
+        read_exact_at(&self.file, &mut b, OFF_BEGIN)?;
         Ok((u64_at(&b, 0), u64_at(&b, 8)))
     }
 
@@ -259,14 +315,14 @@ impl<R: Record> Ring<R> {
         }
         let start = self.end;
         let new_end = start + recs.len() as u64;
-        self.file.write_all_at(&new_end.to_le_bytes(), OFF_BEGIN)?;
+        write_all_at(&self.file, &new_end.to_le_bytes(), OFF_BEGIN)?;
         buf.clear();
         buf.resize(recs.len() * R::SIZE, 0);
         for (r, chunk) in recs.iter().zip(buf.chunks_exact_mut(R::SIZE)) {
             r.encode(chunk);
         }
-        self.segments(start, recs.len() as u64, |off, at, len| self.file.write_all_at(&buf[at..at + len], off))?;
-        self.file.write_all_at(&new_end.to_le_bytes(), OFF_BEGIN + 8)?;
+        self.segments(start, recs.len() as u64, |off, at, len| write_all_at(&self.file, &buf[at..at + len], off))?;
+        write_all_at(&self.file, &new_end.to_le_bytes(), OFF_BEGIN + 8)?;
         self.end = new_end;
         Ok(())
     }
@@ -281,7 +337,7 @@ impl<R: Record> Ring<R> {
         }
         let n = end - start;
         let mut buf = vec![0u8; n as usize * R::SIZE];
-        self.segments(start, n, |off, at, len| self.file.read_exact_at(&mut buf[at..at + len], off))?;
+        self.segments(start, n, |off, at, len| read_exact_at(&self.file, &mut buf[at..at + len], off))?;
         // Slots the writer may have touched since we read `end`.
         let (begin, _) = self.counts()?;
         let safe = begin.saturating_sub(self.cap);
@@ -309,7 +365,7 @@ impl<R: Record> Ring<R> {
         }
         let mut b = vec![0u8; R::SIZE];
         let mut ts_at = |idx: u64| -> io::Result<u64> {
-            self.file.read_exact_at(&mut b, HEADER_LEN + (idx % self.cap) * R::SIZE as u64)?;
+            read_exact_at(&self.file, &mut b, HEADER_LEN + (idx % self.cap) * R::SIZE as u64)?;
             Ok(R::decode(&b).ts_ms())
         };
         // Skip the oldest slot: it is the next one to be overwritten.

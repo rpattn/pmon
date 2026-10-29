@@ -1,0 +1,84 @@
+name: Release
+
+# Push a tag like v0.2.0 to build binaries for every platform and publish a
+# GitHub release. Those release assets are what Scoop, winget and
+# cargo-binstall download.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
+          - { target: aarch64-pc-windows-msvc,   os: windows-latest }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name=pmon-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$name"
+          cp README.md LICENSE "$name"/
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp target/${{ matrix.target }}/release/pmon.exe "$name"/
+            7z a "$name.zip" "$name" >/dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp target/${{ matrix.target }}/release/pmon "$name"/
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - run: sha256sum pmon-* > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            pmon-*
+            SHA256SUMS
+          generate_release_notes: true
+
+  # Opens a PR against microsoft/winget-pkgs for each new release. Enable it
+  # after the first manual submission (see PACKAGING.md) by setting the repo
+  # variable WINGET_IDENTIFIER (e.g. YourName.pmon) and the secret
+  # WINGET_TOKEN (a classic PAT with public_repo scope).
+  winget:
+    needs: release
+    if: vars.WINGET_IDENTIFIER != ''
+    runs-on: windows-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: ${{ vars.WINGET_IDENTIFIER }}
+          installers-regex: '-pc-windows-msvc\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}

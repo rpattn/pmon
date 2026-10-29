@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --release -- -D warnings
+      - run: cargo test --release
+      # The TUI needs a real terminal, but the daemon can be exercised headless.
+      - name: Daemon smoke test
+        env:
+          XDG_STATE_HOME: ${{ runner.temp }}/state
+          LOCALAPPDATA: ${{ runner.temp }}/state
+        run: |
+          pmon=target/release/pmon
+          # (`! cmd` doesn't trip `bash -e`, hence the explicit ifs)
+          if $pmon --status; then exit 1; fi        # not running -> non-zero
+          $pmon -d --retain 1m
+          if $pmon -d; then exit 1; fi              # second instance refused
+          sleep 7
+          $pmon --status
+          $pmon --stop
+          if $pmon --status; then exit 1; fi

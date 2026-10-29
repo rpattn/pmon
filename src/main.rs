@@ -1,12 +1,16 @@
 mod agg;
 mod app;
+mod configure;
 mod daemon;
 mod picker;
 mod sampler;
+mod settings;
 mod store;
+mod theme;
 mod util;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use settings::{Charset, GraphStyle, Settings, ThemeName};
 use std::time::Duration;
 
 fn duration(s: &str) -> Result<Duration, String> {
@@ -19,59 +23,116 @@ fn duration(s: &str) -> Result<Duration, String> {
 
 /// Minimal task-manager-style CPU and RAM monitor for the terminal.
 #[derive(Parser, Debug)]
-#[command(name = "pmon", version)]
+#[command(
+    name = "pmon",
+    version,
+    after_help = "Display settings: pmon --config (or --style, --charset, --theme, --top)"
+)]
 struct Cli {
-    /// Scope the charts to one process. Without a value, opens a fuzzy picker;
-    /// with a name or pid, skips the picker when the match is unambiguous.
+    /// Chart one process; opens a picker unless NAME|PID is unambiguous
     #[arg(short, long, value_name = "NAME|PID", num_args = 0..=1)]
     process: Option<Option<String>>,
 
-    /// Show history recorded by the daemon, then keep following it live.
+    /// Show the daemon's history, then follow it live
     #[arg(short = 'H', long)]
     history: bool,
 
-    /// How far back to show (e.g. 30s, 5m, 1h). With -H it is capped at what
-    /// the daemon has stored. [default: 10m with -H, 2m live]
+    /// How far back to show, e.g. 30s, 5m, 1h [default: 2m, 10m with -H]
     #[arg(long, value_name = "DURATION", value_parser = duration)]
     since: Option<Duration>,
 
-    /// Aggregation bucket size. [default: automatic, fits the chart width]
+    /// Bucket size [default: fit to chart width]
     #[arg(long, value_name = "DURATION", value_parser = duration)]
     agg: Option<Duration>,
 
-    /// Run the history daemon in the background (samples every 2s).
+    /// Choose graph style, characters, theme and top lines, with a live preview
+    #[arg(long, conflicts_with_all = ["process", "history", "since", "agg", "daemon", "stop", "status"])]
+    config: bool,
+
+    // Display settings; usually set once via --config, so kept out of --help.
+    #[arg(long, value_name = "STYLE", hide = true)]
+    style: Option<GraphStyle>,
+    #[arg(long, value_name = "SET", hide = true)]
+    charset: Option<Charset>,
+    #[arg(long, value_name = "THEME", hide = true)]
+    theme: Option<ThemeName>,
+    #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "5", hide = true)]
+    top: Option<usize>,
+
+    /// Start the history daemon (samples every 2s)
     #[arg(short, long, conflicts_with_all = ["process", "history", "since", "agg", "stop", "status"])]
     daemon: bool,
 
-    /// With -d: how much history to keep. [default: 1h]
+    /// With -d: how much history to keep [default: 1h]
     #[arg(long, value_name = "DURATION", value_parser = duration, requires = "daemon")]
     retain: Option<Duration>,
 
-    /// With -d: stay in the foreground (for `systemd --user`).
-    #[arg(long, requires = "daemon")]
+    /// With -d: don't detach (for systemd --user / Task Scheduler)
+    #[arg(long, requires = "daemon", hide = true)]
     foreground: bool,
 
-    /// Stop the running daemon.
+    /// Stop the daemon
     #[arg(long, conflicts_with_all = ["process", "history", "since", "agg", "status"])]
     stop: bool,
 
-    /// Report whether the daemon is running and how much history is stored.
+    /// Show whether the daemon runs and how much history is stored
     #[arg(long, conflicts_with_all = ["process", "history", "since", "agg"])]
     status: bool,
+
+    /// Print a shell completion script (see README). Hidden, and hidden flags
+    /// are left out of the script, so `--c<TAB>` completes to `--config`.
+    #[arg(long, value_name = "SHELL", hide = true, exclusive = true)]
+    completions: Option<clap_complete::Shell>,
+}
+
+/// Command-line display flags win over the config file.
+fn overrides(mut s: Settings, cli: &Cli) -> Settings {
+    s.style = cli.style.unwrap_or(s.style);
+    s.charset = cli.charset.unwrap_or(s.charset);
+    s.theme = cli.theme.unwrap_or(s.theme);
+    s.top = cli.top.unwrap_or(s.top).min(settings::MAX_TOP);
+    s
 }
 
 fn main() {
     // Exit quietly on a closed pipe (`pmon --status | head`) instead of panicking.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
+    if let Some(shell) = cli.completions {
+        // Generators include hidden flags, so build a copy without them.
+        let full = Cli::command();
+        let mut visible = clap::Command::new("pmon")
+            .about(full.get_about().cloned().unwrap_or_default())
+            .version(env!("CARGO_PKG_VERSION"))
+            .args(full.get_arguments().filter(|a| !a.is_hide_set()).cloned());
+        clap_complete::generate(shell, &mut visible, "pmon", &mut std::io::stdout());
+        return;
+    }
     let res = if cli.stop {
         daemon::stop()
     } else if cli.status {
         daemon::status()
     } else if cli.daemon {
         daemon::start(cli.retain.unwrap_or(daemon::DEFAULT_RETAIN), cli.foreground)
+    } else if cli.config {
+        // A broken config file shouldn't lock you out of the tool that fixes it.
+        let (settings, note) = match Settings::load() {
+            Ok(s) => (s, None),
+            Err(e) => {
+                let cause = e.root_cause().to_string();
+                let cause = cause.split(" (expected").next().unwrap_or_default();
+                (Settings::default(), Some(format!("config.toml: {cause}; saving replaces it")))
+            }
+        };
+        configure::run(overrides(settings, &cli), note)
     } else {
-        app::run(app::Options { history: cli.history, process: cli.process, since: cli.since, agg: cli.agg })
+        Settings::load().and_then(|settings| {
+            let settings = overrides(settings, &cli);
+            app::run(app::Options { history: cli.history, process: cli.process, since: cli.since, agg: cli.agg, settings })
+        })
     };
     std::process::exit(match res {
         Ok(code) => code,

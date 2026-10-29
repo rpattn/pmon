@@ -1,7 +1,7 @@
 //! Thin wrapper over `sysinfo`.
 
 use anyhow::{Result, anyhow};
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind};
 
 pub struct Sampler {
     sys: System,
@@ -52,8 +52,55 @@ impl Sampler {
     pub fn processes(&self) -> impl Iterator<Item = &Process> {
         self.sys.processes().values()
     }
+
+    /// The user running pmon (a uid on Unix, a SID on Windows). Needs a prior
+    /// `refresh_processes`.
+    pub fn current_user(&self) -> Option<Uid> {
+        let me = sysinfo::get_current_pid().ok()?;
+        self.sys.process(me)?.user_id().cloned()
+    }
 }
 
-pub fn owned_by(p: &Process, uid: u32) -> bool {
-    p.user_id().is_some_and(|u| **u == uid)
+/// Kills `pid`, but only if it is still the process that started at
+/// `start_time` (so a reused pid is never hit). On Unix sends SIGTERM, or
+/// SIGKILL with `force`; on Windows always terminates. Waits briefly and
+/// returns whether the process has actually exited.
+pub fn kill(pid: u32, start_time: u64, force: bool) -> Result<bool, String> {
+    if pid == std::process::id() {
+        return Err("that's pmon itself".into());
+    }
+    let mut sys = System::new().map_err(|e| e.to_string())?;
+    let p = Pid::from_u32(pid);
+    let alive = |sys: &mut System| {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[p]), true, ProcessRefreshKind::nothing());
+        sys.process(p).is_some_and(|pr| pr.start_time() == start_time)
+    };
+    if !alive(&mut sys) {
+        return Err("no longer running".into());
+    }
+    #[cfg(unix)]
+    {
+        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+        if unsafe { libc::kill(pid as libc::pid_t, sig) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = force;
+        if !sys.process(p).is_some_and(|pr| pr.kill()) {
+            return Err("access denied".into());
+        }
+    }
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if !alive(&mut sys) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn owned_by(p: &Process, user: &Uid) -> bool {
+    p.user_id() == Some(user)
 }
