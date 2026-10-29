@@ -440,7 +440,7 @@ mod tests {
     fn name_matches_rank_first() {
         let items = vec![
             item("bash", 1, "/bin/bash -c run zzstubborn now"),
-            item("zzstubborn", 2, "/tmp/claude-1000/-home-rpattn-dev-pmon/e8ad6d4b-9c62-4169-8b8d-14603b2c0cd0/scratchpad/zzstubborn -c trap \"\" TERM; while :; do sleep 1; done"),
+            item("zzstubborn", 2, "/tmp/test/zzstubborn -c trap \"\" TERM; while :; do sleep 1; done"),
         ];
         let m = fuzzy(&items, "zzstubborn", &mut Matcher::new(Config::DEFAULT));
         assert_eq!(m, vec![1, 0]);

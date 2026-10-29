@@ -1,16 +1,16 @@
 {
     "version": "0.1.0",
     "description": "Minimal terminal CPU / RAM monitor with an optional history daemon",
-    "homepage": "https://github.com/OWNER/pmon",
+    "homepage": "https://github.com/rpattn/pmon",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/OWNER/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip",
+            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip",
             "hash": "REPLACE_WITH_SHA256_FROM_SHA256SUMS",
             "extract_dir": "pmon-v0.1.0-x86_64-pc-windows-msvc"
         },
         "arm64": {
-            "url": "https://github.com/OWNER/pmon/releases/download/v0.1.0/pmon-v0.1.0-aarch64-pc-windows-msvc.zip",
+            "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-aarch64-pc-windows-msvc.zip",
             "hash": "REPLACE_WITH_SHA256_FROM_SHA256SUMS",
             "extract_dir": "pmon-v0.1.0-aarch64-pc-windows-msvc"
         }
@@ -20,11 +20,11 @@
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/OWNER/pmon/releases/download/v$version/pmon-v$version-x86_64-pc-windows-msvc.zip",
+                "url": "https://github.com/rpattn/pmon/releases/download/v$version/pmon-v$version-x86_64-pc-windows-msvc.zip",
                 "extract_dir": "pmon-v$version-x86_64-pc-windows-msvc"
             },
             "arm64": {
-                "url": "https://github.com/OWNER/pmon/releases/download/v$version/pmon-v$version-aarch64-pc-windows-msvc.zip",
+                "url": "https://github.com/rpattn/pmon/releases/download/v$version/pmon-v$version-aarch64-pc-windows-msvc.zip",
                 "extract_dir": "pmon-v$version-aarch64-pc-windows-msvc"
             }
         },

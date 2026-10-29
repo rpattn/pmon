@@ -38,7 +38,7 @@ The first submission is manual; after that CI does it.
 1. After the first release, on Windows:
    ```powershell
    winget install wingetcreate
-   wingetcreate new https://github.com/OWNER/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip
+   wingetcreate new https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip
    ```
    Choose package identifier `YourName.pmon`, installer type **portable** inside
    the zip (`pmon-v0.1.0-x86_64-pc-windows-msvc\pmon.exe`), command alias
@@ -58,7 +58,7 @@ No review needed. After each release, fill in the version and hashes in
 can run:
 
 ```powershell
-scoop install https://raw.githubusercontent.com/OWNER/pmon/main/packaging/scoop/pmon.json
+scoop install https://raw.githubusercontent.com/rpattn/pmon/master/packaging/scoop/pmon.json
 ```
 
 The manifest has `checkver`/`autoupdate`, so if you later move it into a

@@ -46,10 +46,10 @@ back.
 | Platform | Command |
 | -------- | ------- |
 | Windows (winget) | `winget install pmon` |
-| Windows (Scoop)  | `scoop install https://raw.githubusercontent.com/OWNER/pmon/main/packaging/scoop/pmon.json` |
+| Windows (Scoop)  | `scoop install https://raw.githubusercontent.com/rpattn/pmon/master/packaging/scoop/pmon.json` |
 | Any, with Rust   | `cargo install pmon` |
 | Any, prebuilt via [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) | `cargo binstall pmon` |
-| Manual | download a zip / tarball from the [releases page](https://github.com/OWNER/pmon/releases) |
+| Manual | download a zip / tarball from the [releases page](https://github.com/rpattn/pmon/releases) |
 
 The package-manager routes need a published release first; see
 [PACKAGING.md](PACKAGING.md).
