@@ -1,8 +1,9 @@
 //! The TUI: two stacked charts plus a status line.
 
 use crate::agg::{self, Point};
+use crate::daemon;
 use crate::picker::{self, Action, PickItem, Picker, ProcKey};
-use crate::sampler::{self, Sampler};
+use crate::sampler::{self, Sampler, owned_by};
 use crate::settings::{self, DEFAULT_TOP, GraphStyle, MAX_TOP, Settings};
 use crate::theme::{Theme, theme};
 use crate::store::{self, PROC_FILE, ProcRec, Ring, SYS_FILE, SysRec};
@@ -14,13 +15,18 @@ use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Chart, Clear, Dataset, GraphType, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 const LIVE_WINDOW: Duration = Duration::from_secs(120);
 const HISTORY_WINDOW: Duration = Duration::from_secs(600);
-const MIN_WINDOW: Duration = Duration::from_secs(30);
+/// Narrowest view while data is still short of the window: history needs a
+/// few of the daemon's 2s samples; live starts at ten 1s samples so the
+/// chart is filled almost from the first second.
+const MIN_WINDOW_HISTORY: Duration = Duration::from_secs(30);
+const MIN_WINDOW_LIVE: Duration = Duration::from_secs(10);
 /// Borders plus the y-axis label column.
 pub const CHART_CHROME: u16 = 2 + 7;
 
@@ -82,7 +88,16 @@ struct ProcView {
 
 enum Source {
     Live(Box<Sampler>),
-    History { sys: Ring<SysRec>, procs: Option<Ring<ProcRec>>, sys_cur: u64, proc_cur: u64, top_cur: u64 },
+    History {
+        sys: Ring<SysRec>,
+        procs: Option<Ring<ProcRec>>,
+        sys_cur: u64,
+        proc_cur: u64,
+        top_cur: u64,
+        /// Samples locally (not saved) while no daemon is running, so the
+        /// chart carries on live after the stored history.
+        fallback: Option<Box<Sampler>>,
+    },
 }
 
 struct App {
@@ -96,13 +111,20 @@ struct App {
     proc: Option<ProcView>,
     picker: Option<Picker>,
     note: Option<String>,
-    /// Short-lived message, e.g. after saving settings.
-    flash: Option<(String, Instant)>,
+    /// Short-lived message, e.g. after saving settings; `true` = an error.
+    flash: Option<(String, Instant, bool)>,
+    /// History mode: whether a daemon is writing new samples.
+    daemon_up: bool,
     quit: bool,
     settings: Settings,
     theme: Theme,
     /// Top-line count to restore when `t` turns them back on.
     top_last: usize,
+    /// Collect per-process samples. Stays on once top lines have been shown,
+    /// so hiding and showing them again (`t`) is instant.
+    top_tracking: bool,
+    /// Take the next sample soon instead of waiting a full interval.
+    tick_soon: bool,
     tracked: HashMap<(u32, u64), Tracked>,
     help: bool,
 }
@@ -121,7 +143,7 @@ pub fn run(opts: Options) -> Result<i32> {
         let procs = Ring::<ProcRec>::open_reader(&dir.join(PROC_FILE))?;
         let interval = Duration::from_millis(sys.interval_ms.max(1) as u64);
         let ncpu = std::thread::available_parallelism().map_or(1, |n| n.get());
-        (Source::History { sys, procs, sys_cur: 0, proc_cur: 0, top_cur: 0 }, interval, ncpu)
+        (Source::History { sys, procs, sys_cur: 0, proc_cur: 0, top_cur: 0, fallback: None }, interval, ncpu)
     } else {
         let s = Sampler::new()?;
         let ncpu = s.ncpu();
@@ -139,10 +161,13 @@ pub fn run(opts: Options) -> Result<i32> {
         proc: None,
         picker: None,
         note: None,
-        flash: opts.flash.map(|m| (m, Instant::now())),
+        flash: opts.flash.map(|m| (m, Instant::now(), false)),
+        daemon_up: true,
         quit: false,
         theme: theme(opts.settings.theme),
         top_last: if opts.settings.top > 0 { opts.settings.top } else { DEFAULT_TOP },
+        top_tracking: opts.settings.top > 0,
+        tick_soon: false,
         settings: opts.settings,
         tracked: HashMap::new(),
         help: false,
@@ -189,7 +214,12 @@ impl App {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(next_tick.saturating_duration_since(Instant::now()))? {
                 match event::read()? {
-                    Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
+                    Event::Key(k) if k.kind == KeyEventKind::Press => {
+                        self.on_key(k);
+                        if std::mem::take(&mut self.tick_soon) {
+                            next_tick = next_tick.min(Instant::now() + Duration::from_millis(300));
+                        }
+                    }
                     _ => {} // resize etc: just redraw
                 }
             }
@@ -237,27 +267,41 @@ impl App {
             KeyCode::Char('+') | KeyCode::Char('=') => self.set_top((self.settings.top.max(1) + 1).min(MAX_TOP)),
             KeyCode::Char('-') => self.set_top(self.settings.top.saturating_sub(1)),
             KeyCode::Char('w') => {
-                let msg = match self.settings.save() {
-                    Ok(path) => format!("saved defaults to {}", path.display()),
-                    Err(e) => format!("save failed: {e:#}"),
+                let (msg, err) = match self.settings.save() {
+                    Ok(path) => (format!("saved defaults to {}", path.display()), false),
+                    Err(e) => (format!("save failed: {e:#}"), true),
                 };
-                self.flash = Some((msg, Instant::now()));
+                self.flash = Some((msg, Instant::now(), err));
+            }
+            KeyCode::Char('d') => {
+                let (msg, err) = match daemon::start_quiet() {
+                    Ok((pid, retain)) => {
+                        self.daemon_up = true;
+                        let hint = if self.is_history() { "" } else { "; pmon -H shows history" };
+                        (format!("daemon started (pid {pid}, keeping {}){hint}", fmt_dur(retain)), false)
+                    }
+                    Err(e) => (format!("{e:#}"), true),
+                };
+                self.flash = Some((msg, Instant::now(), err));
+                self.tick_soon = true;
             }
             _ => {}
         }
     }
 
+    /// Shows `n` top-process lines (0 hides them). Hiding keeps collecting.
     fn set_top(&mut self, n: usize) {
-        if n == 0 {
-            if self.settings.top > 0 {
-                self.top_last = self.settings.top;
+        if n == 0 && self.settings.top > 0 {
+            self.top_last = self.settings.top;
+        }
+        if n > 0 && !self.top_tracking {
+            self.top_tracking = true;
+            // A process's CPU % needs two readings: take the first one now and
+            // the second shortly, rather than a full interval or two from now.
+            if let Source::Live(s) = &mut self.source {
+                s.refresh_processes(false);
             }
-            // Drop the samples; turning lines back on starts afresh (live) or
-            // re-reads the daemon's file (history).
-            self.tracked.clear();
-            if let Source::History { top_cur, .. } = &mut self.source {
-                *top_cur = 0;
-            }
+            self.tick_soon = true;
         }
         self.settings.top = n;
     }
@@ -266,34 +310,10 @@ impl App {
         self.note = None;
         match &mut self.source {
             Source::Live(s) => {
-                let ts_ms = now_ms();
-                let (cpu, used, total) = s.system();
-                self.mem_total = total;
-                self.system.push(Point { ts_ms, cpu: cpu as f64, mem: used as f64 });
-                if let Some(pv) = self.proc.as_mut().filter(|pv| !pv.gone) {
-                    match s.process(pv.key.pid, pv.key.start_time) {
-                        Some((cpu, rss)) => pv.series.push(Point { ts_ms, cpu: cpu as f64, mem: rss as f64 }),
-                        None => pv.gone = true,
-                    }
-                }
-                if self.settings.top > 0 {
-                    s.refresh_processes(false);
-                    let mut all: Vec<_> = s.processes().collect();
-                    let mut keep = HashSet::new();
-                    all.sort_by(|a, b| b.cpu_usage().total_cmp(&a.cpu_usage()));
-                    keep.extend(all.iter().take(TRACK).filter(|p| p.cpu_usage() > 0.0).map(|p| p.pid()));
-                    all.sort_by_key(|p| std::cmp::Reverse(p.memory()));
-                    keep.extend(all.iter().take(TRACK).map(|p| p.pid()));
-                    for p in all.into_iter().filter(|p| keep.contains(&p.pid())) {
-                        let t = self.tracked.entry((p.pid().as_u32(), p.start_time())).or_insert_with(|| Tracked {
-                            name: p.name().to_string_lossy().into_owned(),
-                            series: Series::default(),
-                        });
-                        t.series.push(Point { ts_ms, cpu: p.cpu_usage() as f64, mem: p.memory() as f64 });
-                    }
-                }
+                let mut sink = Sink { system: &mut self.system, mem_total: &mut self.mem_total, proc: self.proc.as_mut(), tracked: &mut self.tracked };
+                sample_live(s, &mut sink, self.top_tracking, false);
             }
-            Source::History { sys, procs, sys_cur, proc_cur, top_cur } => {
+            Source::History { sys, procs, sys_cur, proc_cur, top_cur, fallback } => {
                 let (system, mem_total) = (&mut self.system, &mut self.mem_total);
                 match sys.read_from(*sys_cur, |r| {
                     *mem_total = r.mem_total;
@@ -308,7 +328,7 @@ impl App {
                         Err(e) => self.note = Some(format!("read error: {e}")),
                     }
                 }
-                if let Some(pr) = procs.as_ref().filter(|_| self.settings.top > 0) {
+                if let Some(pr) = procs.as_ref().filter(|_| self.top_tracking) {
                     let tracked = &mut self.tracked;
                     let res = pr.read_from(*top_cur, |r| {
                         let t = tracked
@@ -325,13 +345,29 @@ impl App {
                 let retention = sys.interval_ms as u64 * sys.capacity();
                 let newest = self.system.last().map_or(0, |p| p.ts_ms);
                 self.system.trim_before(newest.saturating_sub(retention));
+                // With no daemon, carry on with local samples (shown, not saved).
+                // Its records stay the source whenever it runs.
+                self.daemon_up = daemon::is_running();
+                if self.daemon_up {
+                    *fallback = None;
+                } else if let Some(s) = fallback {
+                    let mut sink = Sink { system: &mut self.system, mem_total: &mut self.mem_total, proc: self.proc.as_mut(), tracked: &mut self.tracked };
+                    sample_live(s, &mut sink, self.top_tracking, true);
+                } else if let Ok(mut s) = Sampler::new() {
+                    // CPU % needs two readings; sampling starts next tick.
+                    s.refresh_processes(false);
+                    *fallback = Some(Box::new(s));
+                }
+                let newest = self.system.last().map_or(0, |p| p.ts_ms);
                 if let Some(pv) = &mut self.proc {
                     let last = pv.series.last().map_or(0, |p| p.ts_ms);
                     pv.gone = newest > last + 3 * sys.interval_ms as u64;
                 }
                 let stale = now_ms().saturating_sub(newest);
-                if stale > 5 * sys.interval_ms as u64 {
-                    self.note = Some(format!("no new samples for {} — daemon stopped?", fmt_dur(Duration::from_millis(stale))));
+                if !self.daemon_up {
+                    self.note = Some("not recording: d starts daemon".into());
+                } else if stale > 5 * sys.interval_ms as u64 {
+                    self.note = Some(format!("no new samples for {}", fmt_dur(Duration::from_millis(stale))));
                 }
             }
         }
@@ -379,7 +415,7 @@ impl App {
                 items.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.rss.cmp(&a.rss)));
                 items
             }
-            Source::History { procs: Some(pr), .. } => {
+            Source::History { procs: Some(pr), fallback, .. } => {
                 let mut latest: HashMap<(u32, u64), ProcRec> = HashMap::new();
                 let mut newest = 0;
                 let res = pr.read_from(0, |r| {
@@ -390,6 +426,26 @@ impl App {
                     self.note = Some(format!("read error: {e}"));
                 }
                 let now = now_ms();
+                // Sampling locally: add your processes started since the daemon
+                // stopped, and count anything still running as running.
+                if let Some(s) = fallback {
+                    s.refresh_processes(false);
+                    if let Some(me) = s.current_user() {
+                        for p in s.processes().filter(|p| owned_by(p, &me)) {
+                            let mut r = ProcRec {
+                                ts_ms: now,
+                                start_time: p.start_time(),
+                                rss: p.memory(),
+                                pid: p.pid().as_u32(),
+                                cpu: p.cpu_usage(),
+                                name: [0; 32],
+                            };
+                            r.set_name(p.name().as_encoded_bytes());
+                            latest.insert((r.pid, r.start_time), r);
+                        }
+                        newest = now;
+                    }
+                }
                 let live_after = newest.saturating_sub(3 * pr.interval_ms as u64);
                 let mut recs: Vec<ProcRec> = latest.into_values().collect();
                 // Running first (busiest first), then exited (most recently seen first).
@@ -414,15 +470,21 @@ impl App {
         }
     }
 
-    /// Effective time range and whether it was capped by stored history.
+    /// Effective time range, and whether it was capped by stored history.
+    /// While there is less data than the window, the view covers just the
+    /// data (at least 10s live, 30s history) so it fills the chart: live
+    /// starts zoomed in and widens as time passes; -H is capped (and says so).
     fn range(&self, now: u64) -> (Duration, bool) {
-        if !self.is_history() {
-            return (self.window, false);
-        }
-        let first = self.system.pts.first().map_or(now, |p| p.ts_ms);
-        let stored = Duration::from_millis(now.saturating_sub(first));
-        if stored + self.interval < self.window {
-            (stored.max(MIN_WINDOW).min(self.window), true)
+        // Live process series start when picked; history is about the daemon's data.
+        let series = match &self.proc {
+            Some(pv) if !self.is_history() => &pv.series,
+            _ => &self.system,
+        };
+        let first = series.pts.first().map_or(now, |p| p.ts_ms);
+        let have = Duration::from_millis(now.saturating_sub(first));
+        if have + self.interval < self.window {
+            let min = if self.is_history() { MIN_WINDOW_HISTORY } else { MIN_WINDOW_LIVE };
+            (have.max(min).min(self.window), self.is_history())
         } else {
             (self.window, false)
         }
@@ -452,6 +514,9 @@ impl App {
         let (cpu_top_lines, mem_top_lines) =
             if is_proc || self.settings.top == 0 { (vec![], vec![]) } else { self.top_lines(now, range, bucket) };
         let th = &self.theme;
+        // Samples drift a little, so one empty bucket is normal; two or more
+        // missing samples is an outage.
+        let gap = (bucket + self.interval * 2).as_secs_f64();
 
         // CPU: system is 0–100% of the whole machine; a process is top-style
         // (100% = one core) on an axis that grows in 100% steps up to N*100%.
@@ -472,6 +537,7 @@ impl App {
                 top: &cpu_top_lines,
                 y_top: cpu_top,
                 y_labels: [0.0, cpu_top / 2.0, cpu_top].map(|v| format!("{v:.0}%")),
+                gap,
             },
             range,
             bucket,
@@ -499,6 +565,7 @@ impl App {
                 top: &mem_top_lines,
                 y_top: mem_top,
                 y_labels: [0.0, mem_top / 2.0, mem_top].map(fmt_bytes_short),
+                gap,
             },
             range,
             bucket,
@@ -566,7 +633,7 @@ impl App {
         let th = &self.theme;
         let st = &self.settings;
         let top = if st.top > 0 { format!("on ({})", st.top) } else { "off".into() };
-        let rows: [(&str, &str, String); 11] = [
+        let rows: [(&str, &str, String); 12] = [
             ("q", "quit", String::new()),
             ("/", "pick a process (Del kills)", String::new()),
             ("Esc", "back to system-wide", String::new()),
@@ -576,6 +643,7 @@ impl App {
             ("g", "characters", settings::name(&st.charset)),
             ("c", "theme", settings::name(&st.theme)),
             ("w", "save these as defaults", String::new()),
+            ("d", "start the history daemon", String::new()),
             ("", "", String::new()),
             ("Esc ?", "close help", String::new()),
         ];
@@ -615,17 +683,18 @@ impl App {
         ];
         let mut warnings = Vec::new();
         if capped {
-            warnings.push(format!("only {} stored", fmt_dur(range)));
+            warnings.push(format!("only {} of data", fmt_dur(range)));
         }
         warnings.extend(self.note.clone());
         let mut warnings: Vec<Span> = warnings
             .into_iter()
             .flat_map(|w| [Span::styled("│ ", dim), Span::styled(w + " ", Style::new().fg(th.warn))])
             .collect();
-        if let Some((msg, at)) = &self.flash
+        if let Some((msg, at, err)) = &self.flash
             && at.elapsed() < Duration::from_secs(5)
         {
-            warnings.extend([Span::styled("│ ", dim), Span::styled(format!("{msg} "), Style::new().fg(th.ok))]);
+            let color = if *err { th.err } else { th.ok };
+            warnings.extend([Span::styled("│ ", dim), Span::styled(format!("{msg} "), Style::new().fg(color))]);
         }
         let (iv, bk) = (fmt_dur(self.interval), fmt_dur(bucket));
         // Most detailed variant that fits; warnings and keys always stay.
@@ -640,6 +709,48 @@ impl App {
         let mut spans = vec![mode, Span::raw(info.clone())];
         spans.extend(rest);
         f.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+}
+
+/// Where locally taken samples go.
+struct Sink<'a> {
+    system: &'a mut Series,
+    mem_total: &'a mut u64,
+    proc: Option<&'a mut ProcView>,
+    tracked: &'a mut HashMap<(u32, u64), Tracked>,
+}
+
+/// One local sample: system totals, the selected process, and (if tracking)
+/// candidates for the top-process lines. `own_only` limits those to the
+/// current user's processes, matching what the daemon records.
+fn sample_live(s: &mut Sampler, sink: &mut Sink, top: bool, own_only: bool) {
+    let ts_ms = now_ms();
+    let (cpu, used, total) = s.system();
+    *sink.mem_total = total;
+    sink.system.push(Point { ts_ms, cpu: cpu as f64, mem: used as f64 });
+    if let Some(pv) = sink.proc.as_deref_mut().filter(|pv| !pv.gone) {
+        match s.process(pv.key.pid, pv.key.start_time) {
+            Some((cpu, rss)) => pv.series.push(Point { ts_ms, cpu: cpu as f64, mem: rss as f64 }),
+            None => pv.gone = true,
+        }
+    }
+    if !top {
+        return;
+    }
+    s.refresh_processes(false);
+    let me = if own_only { s.current_user() } else { None };
+    let mut all: Vec<_> = s.processes().filter(|p| me.as_ref().is_none_or(|u| owned_by(p, u))).collect();
+    let mut keep = HashSet::new();
+    all.sort_by(|a, b| b.cpu_usage().total_cmp(&a.cpu_usage()));
+    keep.extend(all.iter().take(TRACK).filter(|p| p.cpu_usage() > 0.0).map(|p| p.pid()));
+    all.sort_by_key(|p| std::cmp::Reverse(p.memory()));
+    keep.extend(all.iter().take(TRACK).map(|p| p.pid()));
+    for p in all.into_iter().filter(|p| keep.contains(&p.pid())) {
+        let t = sink.tracked.entry((p.pid().as_u32(), p.start_time())).or_insert_with(|| Tracked {
+            name: p.name().to_string_lossy().into_owned(),
+            series: Series::default(),
+        });
+        t.series.push(Point { ts_ms, cpu: p.cpu_usage() as f64, mem: p.memory() as f64 });
     }
 }
 
@@ -671,6 +782,9 @@ pub struct ChartSpec<'a> {
     pub top: &'a [TopLine],
     pub y_top: f64,
     pub y_labels: [String; 3],
+    /// A jump between points wider than this (seconds) is missing data, drawn
+    /// as a gap rather than a line across it.
+    pub gap: f64,
 }
 
 /// Running totals of the top-process series at each of the total's points:
@@ -772,30 +886,66 @@ fn bars(pts: &[(f64, f64)], range: f64, bucket: f64, slots: usize) -> agg::Xy {
     out
 }
 
+/// Splits a series where data is missing (the daemon was stopped, the
+/// machine slept), so the outage shows as a gap instead of a straight line
+/// drawn across it.
+fn split_gaps(pts: &[(f64, f64)], gap: f64) -> Vec<&[(f64, f64)]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 1..pts.len() {
+        if pts[i].0 - pts[i - 1].0 > gap {
+            out.push(&pts[start..i]);
+            start = i;
+        }
+    }
+    if start < pts.len() {
+        out.push(&pts[start..]);
+    }
+    out
+}
+
+/// A line needs two points to show at all; draw a lone point (the first
+/// bucket of a new series, or a short run between gaps) as a flat segment
+/// one bucket wide.
+fn widen_lone(pts: &[(f64, f64)], bucket: f64) -> Cow<'_, [(f64, f64)]> {
+    match pts {
+        [(x, y)] => Cow::Owned(vec![(x - bucket, *y), (*x, *y)]),
+        _ => Cow::Borrowed(pts),
+    }
+}
+
 pub fn render_chart(f: &mut Frame, area: Rect, spec: ChartSpec, range: Duration, bucket: Duration, st: &Settings, th: &Theme) {
-    let axis_style = Style::new().fg(th.dim);
+    let b = bucket.as_secs_f64();
     let r = range.as_secs_f64();
+    let axis_style = Style::new().fg(th.dim);
     let x_labels = [format!("-{}", fmt_dur(range)), format!("-{}", fmt_dur(range / 2)), "now".to_string()];
     // Same label width on both charts keeps their time axes aligned.
     let y_labels = spec.y_labels.map(|l| format!("{l:>5}"));
     let marker = st.charset.marker();
-    let main_pts = if st.style == GraphStyle::Bars {
+    let dataset = |color: Color, kind: GraphType, pts| {
+        Dataset::default().marker(marker).graph_type(kind).style(Style::new().fg(color)).data(pts)
+    };
+    let segments = |pts| split_gaps(pts, spec.gap).into_iter().map(|seg| widen_lone(seg, b)).collect::<Vec<_>>();
+
+    // The total: bars are resampled per column (and skip columns without
+    // data); everything else is drawn per gap-free segment.
+    let main_bars;
+    let main_segs = if st.style == GraphStyle::Bars {
         use settings::Charset::*;
         let per_cell = if matches!(st.charset, Braille | Octant | Sextant | Quadrant) { 2 } else { 1 };
         let slots = area.width.saturating_sub(CHART_CHROME).max(1) as usize * per_cell;
-        bars(spec.main, r, bucket.as_secs_f64(), slots)
+        main_bars = bars(spec.main, r, b, slots);
+        vec![Cow::Borrowed(&main_bars[..])]
     } else {
-        spec.main.to_vec()
+        segments(spec.main)
     };
-    let main = Dataset::default()
-        .marker(marker)
-        .graph_type(st.style.graph_type())
-        .style(Style::new().fg(spec.color))
-        .data(&main_pts);
+    let main = main_segs.iter().map(|seg| dataset(spec.color, st.style.graph_type(), seg));
+
     // A cell shows only the last dataset drawn into it, so overlaid lines
     // would punch holes in a filled area. In area mode the processes become
     // stacked bands instead: biggest first (at the bottom), the total's colour
-    // filling the rest.
+    // filling the rest. Bands only fill cells whose bucket has data, so gaps
+    // stay empty.
     let mut stacked = if st.style == GraphStyle::Area { stack(spec.main, spec.top) } else { vec![] };
     if !stacked.is_empty() {
         // Plot size in cells: minus borders, x-axis line and labels (height);
@@ -805,20 +955,20 @@ pub fn render_chart(f: &mut Frame, area: Rect, spec: ChartSpec, range: Duration,
         let (dx, dy) = st.charset.dots_per_cell();
         snap_bands(spec.main, &mut stacked, spec.y_top, rows, dy);
         for band in &mut stacked {
-            *band = band_columns(band, r, bucket.as_secs_f64(), cols, dx);
+            *band = band_columns(band, r, b, cols, dx);
         }
     }
+    let top_segs: Vec<Vec<_>> =
+        if st.style == GraphStyle::Area { vec![] } else { spec.top.iter().map(|t| segments(&t.pts)).collect() };
     let datasets: Vec<Dataset> = if st.style == GraphStyle::Area {
-        let bands = spec.top.iter().zip(&stacked).rev().map(|(t, pts)| {
-            Dataset::default().marker(marker).graph_type(GraphType::Bar).style(Style::new().fg(t.color)).data(pts)
-        });
-        std::iter::once(main).chain(bands).collect()
+        let bands = spec.top.iter().zip(&stacked).rev().map(|(t, pts)| dataset(t.color, GraphType::Bar, pts));
+        main.chain(bands).collect()
     } else {
-        let lines = spec.top.iter().map(|t| {
-            Dataset::default().marker(marker).graph_type(st.style.graph_type()).style(Style::new().fg(t.color)).data(&t.pts)
+        let lines = spec.top.iter().zip(&top_segs).flat_map(|(t, segs)| {
+            segs.iter().map(|seg| dataset(t.color, st.style.graph_type(), seg)).collect::<Vec<_>>()
         });
         // The total goes last so it stays visible on top of the process lines.
-        lines.chain(std::iter::once(main)).collect()
+        lines.chain(main).collect()
     };
 
     let mut block = Block::bordered().border_style(axis_style).title(spec.title);
@@ -854,5 +1004,21 @@ mod tests {
         let s = stack(&total, &tops);
         assert_eq!(s[0], vec![(-2.0, 20.0), (-1.0, 30.0), (0.0, 20.0)]);
         assert_eq!(s[1], vec![(-2.0, 20.0), (-1.0, 50.0), (0.0, 30.0)]);
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn splits_only_on_real_gaps() {
+        let pts = [(-10.0, 1.0), (-8.0, 1.0), (-4.0, 1.0), (-2.0, 1.0), (0.0, 1.0)];
+        // Bucket 2s: a 4s jump (one missing bucket) is tolerated with a 6s threshold...
+        assert_eq!(split_gaps(&pts, 6.0).len(), 1);
+        // ...but not with a tighter one.
+        let segs = split_gaps(&pts, 3.0);
+        assert_eq!(segs, vec![&pts[..2], &pts[2..]]);
+        assert!(split_gaps(&[], 3.0).is_empty());
     }
 }

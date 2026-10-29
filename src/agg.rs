@@ -26,31 +26,45 @@ pub fn auto_bucket(range: Duration, cols: u16, interval: Duration) -> Duration {
 /// **max** of each bucket so short spikes stay visible. Returns `(cpu, mem)`
 /// series with x in seconds relative to now (<= 0). Buckets are aligned to
 /// wall-clock multiples of `bucket` so they don't jitter as time advances.
+///
+/// Each bucket is plotted at its end (or now, if still open). A bucket that
+/// starts a run (the first, or after missing buckets) also gets a point at
+/// its first sample, so a new series begins where its data begins instead of
+/// one whole bucket earlier, and grows from there.
 pub fn aggregate(pts: &[Point], now_ms: u64, range: Duration, bucket: Duration) -> (Xy, Xy) {
     let start = now_ms.saturating_sub(range.as_millis() as u64);
     let b = (bucket.as_millis() as u64).max(1);
     let first = pts.partition_point(|p| p.ts_ms < start);
     let (mut cpu, mut mem) = (Vec::new(), Vec::new());
-    let mut emit = |id: u64, c: f64, m: f64| {
-        let x = (((id + 1) * b).min(now_ms) as f64 - now_ms as f64) / 1000.0;
-        cpu.push((x, c));
-        mem.push((x, m));
+    let rel = |ts: u64| (ts.min(now_ms) as f64 - now_ms as f64) / 1000.0;
+    let mut last_id: Option<u64> = None;
+    let mut emit = |id: u64, first_ts: u64, c: f64, m: f64| {
+        let end = rel((id + 1) * b);
+        let start = rel(first_ts);
+        if last_id.is_none_or(|l| l + 1 != id) && start < end {
+            cpu.push((start, c));
+            mem.push((start, m));
+        }
+        cpu.push((end, c));
+        mem.push((end, m));
+        last_id = Some(id);
     };
-    let mut cur: Option<(u64, f64, f64)> = None;
+    // (bucket id, first sample's ts, max cpu, max mem)
+    let mut cur: Option<(u64, u64, f64, f64)> = None;
     for p in &pts[first..] {
         let id = p.ts_ms / b;
         cur = match cur {
-            Some((cid, c, m)) if cid == id => Some((cid, c.max(p.cpu), m.max(p.mem))),
+            Some((cid, t0, c, m)) if cid == id => Some((cid, t0, c.max(p.cpu), m.max(p.mem))),
             prev => {
-                if let Some((cid, c, m)) = prev {
-                    emit(cid, c, m);
+                if let Some((cid, t0, c, m)) = prev {
+                    emit(cid, t0, c, m);
                 }
-                Some((id, p.cpu, p.mem))
+                Some((id, p.ts_ms, p.cpu, p.mem))
             }
         };
     }
-    if let Some((cid, c, m)) = cur {
-        emit(cid, c, m);
+    if let Some((cid, t0, c, m)) = cur {
+        emit(cid, t0, c, m);
     }
     (cpu, mem)
 }
@@ -74,7 +88,16 @@ mod tests {
             .map(|&(ts_ms, cpu)| Point { ts_ms, cpu, mem: cpu * 2.0 })
             .collect();
         let (cpu, mem) = aggregate(&pts, 10_000, Duration::from_secs(10), Duration::from_secs(5));
-        assert_eq!(cpu, vec![(-5.0, 90.0), (0.0, 5.0)]);
+        // The first bucket also gets a point at its first sample (t=1s).
+        assert_eq!(cpu, vec![(-9.0, 90.0), (-5.0, 90.0), (0.0, 5.0)]);
         assert_eq!(mem[0].1, 180.0);
+    }
+
+    #[test]
+    fn open_bucket_spans_from_first_sample_to_now() {
+        // One sample 0.3s ago in a 2s bucket that is still open.
+        let pts = [Point { ts_ms: 9_700, cpu: 7.0, mem: 1.0 }];
+        let (cpu, _) = aggregate(&pts, 10_000, Duration::from_secs(120), Duration::from_secs(2));
+        assert_eq!(cpu, vec![(-0.3, 7.0), (0.0, 7.0)]);
     }
 }

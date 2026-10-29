@@ -37,22 +37,60 @@ fn daemon_pid(dir: &Path) -> Option<u32> {
     }
 }
 
-pub fn start(retain: Duration, foreground: bool) -> Result<i32> {
+pub fn is_running() -> bool {
+    daemon_pid(&store::state_dir()).is_some()
+}
+
+/// `--retain` if given, else whatever the stored history was recorded with
+/// (a different retention recreates the files, losing the history), else 1h.
+fn resolve_retain(dir: &Path, retain: Option<Duration>) -> Result<Duration> {
+    let stored = || {
+        let r = Ring::<SysRec>::open_reader(&dir.join(SYS_FILE)).ok().flatten()?;
+        Some(Duration::from_millis(r.interval_ms as u64 * r.capacity()))
+    };
+    let retain = retain.or_else(stored).unwrap_or(DEFAULT_RETAIN);
     if retain < INTERVAL * 2 {
         bail!("--retain must be at least {}", fmt_dur(INTERVAL * 2));
     }
+    Ok(retain)
+}
+
+pub fn start(retain: Option<Duration>, foreground: bool) -> Result<i32> {
     let dir = store::state_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     if let Some(pid) = daemon_pid(&dir) {
         eprintln!("pmon: daemon already running (pid {pid})");
         return Ok(1);
     }
-    if foreground { run_foreground(&dir, retain) } else { spawn_background(&dir, retain) }
+    let retain = resolve_retain(&dir, retain)?;
+    if foreground {
+        return run_foreground(&dir, retain);
+    }
+    let pid = spawn_background(&dir, retain)?;
+    println!(
+        "pmon daemon started (pid {pid}): sampling every {}, keeping {}, data in {}",
+        fmt_dur(INTERVAL),
+        fmt_dur(retain),
+        dir.display()
+    );
+    Ok(0)
+}
+
+/// Starts the daemon from inside the TUI (nothing printed). Returns its pid
+/// and retention.
+pub fn start_quiet() -> Result<(u32, Duration)> {
+    let dir = store::state_dir();
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    if let Some(pid) = daemon_pid(&dir) {
+        bail!("daemon already running (pid {pid})");
+    }
+    let retain = resolve_retain(&dir, None)?;
+    Ok((spawn_background(&dir, retain)?, retain))
 }
 
 /// Starts `pmon --daemon --foreground` detached from this terminal and waits
 /// until it has taken the lock, so start-up errors are still reported here.
-fn spawn_background(dir: &Path, retain: Duration) -> Result<i32> {
+fn spawn_background(dir: &Path, retain: Duration) -> Result<u32> {
     let log_path = dir.join(LOGFILE);
     let log = File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
     let mut cmd = Command::new(std::env::current_exe().context("locating the pmon executable")?);
@@ -71,14 +109,7 @@ fn spawn_background(dir: &Path, retain: Duration) -> Result<i32> {
             bail!("daemon exited during start-up ({status})\n{}", log.trim_end());
         }
         if daemon_pid(dir) == Some(child.id()) {
-            println!(
-                "pmon daemon started (pid {}): sampling every {}, keeping {}, data in {}",
-                child.id(),
-                fmt_dur(INTERVAL),
-                fmt_dur(retain),
-                dir.display()
-            );
-            return Ok(0);
+            return Ok(child.id());
         }
         std::thread::sleep(Duration::from_millis(50));
     }

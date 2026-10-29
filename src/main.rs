@@ -64,7 +64,7 @@ struct Cli {
     #[arg(short, long, conflicts_with_all = ["process", "history", "since", "agg", "stop", "status"])]
     daemon: bool,
 
-    /// With -d: how much history to keep [default: 1h]
+    /// With -d: how much history to keep [default: as stored, else 1h]
     #[arg(long, value_name = "DURATION", value_parser = duration, requires = "daemon")]
     retain: Option<Duration>,
 
@@ -127,7 +127,7 @@ fn main() {
     } else if cli.status {
         daemon::status()
     } else if cli.daemon {
-        daemon::start(cli.retain.unwrap_or(daemon::DEFAULT_RETAIN), cli.foreground)
+        daemon::start(cli.retain, cli.foreground)
     } else if cli.config {
         let installed = completions::auto(visible_command());
         // A broken config file shouldn't lock you out of the tool that fixes it.

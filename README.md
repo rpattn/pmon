@@ -112,6 +112,7 @@ Durations use `humantime` syntax: `30s`, `5m`, `1h`, `1h30m`, `2days`.
 | `g`            | cycle character set                              |
 | `c`            | cycle theme                                      |
 | `w`            | save current style / characters / theme / top as defaults |
+| `d`            | start the history daemon (with `-H`, the status line says when it isn't running) |
 | picker: type   | fuzzy filter (name, pid, command line)           |
 | picker: `↑ ↓`, `Ctrl-P/N`, `PgUp/PgDn` | move                     |
 | picker: `Enter`| select · `Ctrl-U` clear · `Ctrl-W` delete word   |
@@ -166,7 +167,8 @@ flag for one run. The flags are left out of `--help` to keep it short.
   would punch holes in it. The stack is capped at the total, because RSS
   double-counts shared memory. CPU lines are scaled to the
   whole machine like the total (one busy core on an 8-core machine is 12.5%),
-  so they always sit at or under the total line. In live mode, lines start when
+  so they always sit at or under the total line. Pressing `t` to hide the lines keeps
+  collecting in the background, so showing them again is instant. In live mode, lines start when
   you turn them on; with `-H` they come from the daemon's history, which covers
   only your own processes.
 
@@ -193,7 +195,13 @@ Command-line flags override the file for that run.
   in 100% steps (up to `cores × 100%`) when the process uses more.
 - **RAM, system scope:** used memory (total − available), axis 0 → total RAM.
 - **RSS, process scope:** resident set size, axis scaled to the peak in view.
-- **X axis:** time relative to now (`-10m … now`). The view slides as time passes.
+- **X axis:** time relative to now (`-10m … now`). The view slides as time
+  passes. Live mode starts zoomed in on the data it has (10s) and widens as
+  samples arrive, up to `--since` (default 2m), so the chart isn't empty at
+  start.
+- **Gaps:** where samples are missing (the daemon was stopped, the machine
+  slept), the chart shows a gap instead of a line drawn across it. One missed
+  sample is ignored, since sampling drifts slightly; two or more make a gap.
 
 ### Aggregation
 
@@ -206,10 +214,14 @@ shimmer as the window slides. Override the size with `--agg <duration>`.
 
 The status line shows the sample interval, bucket size and range, e.g.
 `every 2s · bucket 10s max · 10m`. When `--since` asks for more than the daemon
-has stored, the range is capped and the status line says `only 37m stored`.
+has stored, the range is capped and the status line says `only 37m of data`.
 
 Live mode samples every second. History mode uses the daemon's 2s samples and
-re-reads the daemon's file each second, so it doesn't sample separately.
+re-reads the daemon's file each second, so it doesn't sample separately. If no
+daemon is running, `-H` still shows whatever history is stored, then a gap,
+then live data that pmon samples itself. Those samples are shown but not
+saved, and the status line says `not recording: d starts daemon`. Once a
+daemon runs (press `d`), pmon switches back to its data seamlessly.
 
 ## The daemon
 
@@ -240,6 +252,9 @@ Typical cost is ~4 MB RSS on Linux (~13 MB working set on Windows, which lists
 many more per-user processes) and well under 1% of one core.
 
 ### Retention
+
+Restarting with plain `pmon -d` keeps the retention the stored history was
+recorded with; only an explicit `--retain` changes it.
 
 `--retain` (default `1h`) sets the number of slots in the ring files. The
 process ring is sized for twice the number of your processes at startup (at
@@ -279,6 +294,18 @@ schtasks /Create /SC ONLOGON /TN pmon /TR "\"$((Get-Command pmon).Source)\" --da
 
 Remove it with `schtasks /Delete /TN pmon /F`. A console window may flash
 briefly at logon while `pmon -d` launches the detached daemon.
+
+### WSL notes
+
+WSL shuts its Linux VM down shortly after the last terminal closes, which
+stops the daemon (and WSL doesn't run systemd by default, so the unit above
+won't start it). History then has a gap until the daemon runs again: press
+`d` in `pmon -H`, or start it whenever you open a shell by adding this to
+`~/.bashrc`:
+
+```bash
+pmon -d >/dev/null 2>&1  # start pmon's history daemon unless already running
+```
 
 ### Windows notes
 
