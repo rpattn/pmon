@@ -155,7 +155,7 @@ fn draw(f: &mut Frame, st: &Settings, row: usize, panel_cur: usize, edit: Option
         return;
     }
     let th = theme(st.theme);
-    let [body, keys] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    let [body, _, keys] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(area);
     // Menu beside the preview on wide terminals, above it otherwise.
     let menu_h = ROWS.len() as u16 + 3;
     let (menu, preview) = if body.width >= 120 {

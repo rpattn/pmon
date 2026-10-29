@@ -84,7 +84,8 @@ pub fn layout(area: Rect, kinds: &[PanelKind], arr: &Arrangement, focus: Option<
             },
         },
     };
-    let row_rects = Layout::vertical(vec![Constraint::Fill(1); rows.len()]).split(area);
+    let heights = row_heights(area, &rows);
+    let row_rects = Layout::vertical(heights.iter().map(|&h| Constraint::Length(h))).split(area);
     rows.iter()
         .zip(row_rects.iter())
         .flat_map(|(row, &rect)| {
@@ -92,6 +93,40 @@ pub fn layout(area: Rect, kinds: &[PanelKind], arr: &Arrangement, focus: Option<
             row.iter().copied().zip(cells.iter().copied()).collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Splits the height between rows, but never makes a panel taller than it
+/// looks wide: a cell is about twice as tall as it is wide, so a row's height
+/// is capped at half its narrowest panel's width. Rows below their cap share
+/// what's left; anything still left over stays empty below the panels.
+fn row_heights(area: Rect, rows: &[Vec<PanelKind>]) -> Vec<u16> {
+    let caps: Vec<u16> = rows.iter().map(|r| (area.width / r.len().max(1) as u16 / 2).max(MIN_CHART_HEIGHT)).collect();
+    let mut heights = vec![0u16; rows.len()];
+    let mut open: Vec<usize> = (0..rows.len()).collect();
+    let mut left = area.height;
+    while !open.is_empty() {
+        let share = left / open.len() as u16;
+        let capped: Vec<usize> = open.iter().copied().filter(|&i| caps[i] <= share).collect();
+        if capped.is_empty() {
+            // Nobody hits a cap: split evenly, the remainder going to the first rows.
+            let extra = left - share * open.len() as u16;
+            for (k, &i) in open.iter().enumerate() {
+                heights[i] = share + u16::from((k as u16) < extra);
+            }
+            break;
+        }
+        for i in capped {
+            heights[i] = caps[i];
+            left -= caps[i];
+            open.retain(|&j| j != i);
+        }
+    }
+    heights
+}
+
+/// Rows the panels actually use in `area` (at most `area.height`).
+pub fn used_height(area: Rect, kinds: &[PanelKind], arr: &Arrangement, focus: Option<PanelKind>) -> u16 {
+    layout(area, kinds, arr, focus).iter().map(|(_, r)| r.bottom()).max().map_or(0, |b| b - area.y)
 }
 
 /// The part of a panel's rectangle the chart gets (the rest is stats).
@@ -167,6 +202,19 @@ mod tests {
 
     fn widths(area: Rect, kinds: &[PanelKind], arr: &Arrangement) -> Vec<(PanelKind, u16)> {
         layout(area, kinds, arr, None).into_iter().map(|(k, r)| (k, r.width)).collect()
+    }
+
+    #[test]
+    fn panels_are_never_taller_than_wide() {
+        // Five columns on a tall screen: 16 wide, so at most 8 rows tall.
+        let cols = Arrangement::Preset(LayoutKind::Columns);
+        let placed = layout(Rect::new(0, 0, 80, 60), &[Cpu, Ram, Disk, Net, Gpu], &cols, None);
+        assert!(placed.iter().all(|(_, r)| r.height == 8));
+        // Rows that hit the cap give their spare height to the others.
+        let t = parse_layout("cpu ram disk net / gpu").unwrap();
+        let placed = layout(Rect::new(0, 0, 80, 40), &[Cpu, Ram, Disk, Net, Gpu], &t, None);
+        assert_eq!((placed[0].1.height, placed[4].1.height), (10, 30));
+        assert_eq!(used_height(Rect::new(0, 0, 80, 60), &[Cpu, Ram, Disk, Net, Gpu], &cols, None), 8);
     }
 
     #[test]

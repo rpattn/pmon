@@ -262,7 +262,13 @@ pub fn run(opts: Options) -> Result<i32> {
         }
     }
 
-    let inline = app.settings.inline;
+    // Inline: only as many rows as the panels use at this width (plus the
+    // margin and status line), up to the configured height.
+    let inline = app.settings.inline.map(|rows| {
+        let width = crossterm::terminal::size().map_or(80, |(w, _)| w);
+        let used = panels::used_height(Rect::new(0, 0, width, rows.saturating_sub(2)), &app.visible_panels(), &app.settings.layout, app.settings.focus);
+        (used + 2).clamp(8, rows)
+    });
     let mut terminal = match inline {
         Some(rows) => match ratatui::try_init_with_options(TerminalOptions { viewport: Viewport::Inline(rows) }) {
             Ok(t) => t,
@@ -370,6 +376,13 @@ impl App {
             KeyCode::Char('c') => {
                 self.settings.theme = settings::next(&self.settings.theme);
                 self.theme = theme(self.settings.theme);
+            }
+            KeyCode::Char('f') => {
+                let choices: Vec<Option<PanelKind>> = std::iter::once(None).chain(PanelKind::ALL.map(Some)).collect();
+                let i = choices.iter().position(|&c| c == self.settings.focus).unwrap_or(0);
+                self.settings.focus = choices[(i + 1) % choices.len()];
+                let what = self.settings.focus.map_or("none (last panel spans)".into(), |k| settings::name(&k));
+                self.flash = Some((format!("focus: {what}"), Instant::now(), false));
             }
             KeyCode::Char('l') => self.settings.layout = self.settings.layout.step(self.custom_layout.as_ref(), 1),
             KeyCode::Char('a') => {
@@ -674,7 +687,9 @@ impl App {
             f.render_widget(Paragraph::new("terminal too small"), area);
             return;
         }
-        let [main_area, status_area] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+        // A blank row keeps the panels' bottom border off the status line.
+        let [main_area, _, status_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Length(1)]).areas(area);
 
         let now = now_ms();
         let (range, capped) = self.range(now);
@@ -972,6 +987,7 @@ impl App {
             ("Panels", vec![
                 ("1-5", chips, String::new()),
                 ("l", text("layout"), st.layout.text()),
+                ("f", text("focus (wide in odd grid)"), settings::focus_str(st.focus)),
                 ("i", text("stats boxes"), on_off(st.stats)),
             ]),
             ("Processes", vec![

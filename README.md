@@ -119,6 +119,7 @@ Durations use `humantime` syntax: `30s`, `5m`, `1h`, `1h30m`, `2days`.
 | `?`            | help overlay showing keys and current settings   |
 | `1`–`5`        | show/hide the CPU, RAM, disk, network, GPU panels |
 | `l`            | cycle layout (your template, auto, rows, columns, grid) |
+| `f`            | cycle the focus panel (full-width in an odd grid) |
 | `a`            | group processes by app on/off                    |
 | `i`            | stats boxes on/off                               |
 | `t`            | top-process lines on/off                         |
@@ -161,7 +162,7 @@ flag for one run. The flags are left out of `--help` to keep it short.
 | ------ | ------ | --- |
 | `--panels` | any of `cpu`, `ram`, `disk`, `net`, `gpu` (default: all) | `1`–`5` |
 | `--layout` | `auto` (default), `rows`, `columns`, `grid`, or a template like `"cpu / ram disk / net gpu"` | `l` |
-| `--focus` | `cpu` (default), `ram`, `disk`, `net`, `gpu`, `none`: the panel given the full-width row in an odd grid | |
+| `--focus` | `cpu` (default), `ram`, `disk`, `net`, `gpu`, `none`: the panel given the full-width row in an odd grid | `f` |
 | `--group` | `on` (default) / `off`: combine processes with the same name into one app | `a` |
 | `--stats` | `on` (default) / `off` | `i` |
 | `--inline [ROWS]` | draw below the prompt, default 24 rows; off by default | |
@@ -182,6 +183,10 @@ flag for one run. The flags are left out of `--help` to keep it short.
   GPU → `net` fills its row), and enabled panels the template leaves out are
   added below it. In `--config`, press `e` on the Layout row to type one with a
   live preview; `l` in the monitor cycles your template and the presets.
+- **Proportions:** a panel is never taller than it looks wide (its height in
+  rows is at most half its width in columns, since terminal cells are about
+  twice as tall as wide). On a tall terminal the spare rows stay empty below
+  the panels instead of stretching them.
 - **Grouping by app** (on by default): processes with the same name, such as a
   browser's or an Electron app's many processes, count as one app (`chrome ×12`)
   in stats lists and top lines, with their CPU, memory, disk and GPU summed
@@ -192,7 +197,8 @@ flag for one run. The flags are left out of `--help` to keep it short.
 - **Stats boxes** sit to the right of each chart when the panel is at least 64
   columns wide; narrower panels just show the chart.
 - **Inline mode** (`--inline`, or `inline = 24` in the config) draws in a
-  region below your prompt instead of taking over the screen. On `q` or
+  region below your prompt instead of taking over the screen. It uses only the
+  rows the panels need at the current width (up to the number given). On `q` or
   Ctrl-C the last frame stays in your scrollback with a summary line
   (`pmon ran 3m · every 1s · …`), and the prompt continues below it.
 - **Character sets:** `braille` and `octant` give the finest lines (2×4 dots
