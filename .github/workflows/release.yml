@@ -28,6 +28,15 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      # The tag must match Cargo.toml, or the binaries report the wrong
+      # version and `cargo publish` of the same code is rejected.
+      - name: Check tag matches Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version; bump the version, then tag."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

@@ -6,12 +6,12 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-x86_64-pc-windows-msvc.zip",
-            "hash": "REPLACE_WITH_SHA256_FROM_SHA256SUMS",
+            "hash": "f21c651b42ba071981a016abc1c90921ddf47d4ed40282bb18007c1497727ed3",
             "extract_dir": "pmon-v0.1.0-x86_64-pc-windows-msvc"
         },
         "arm64": {
             "url": "https://github.com/rpattn/pmon/releases/download/v0.1.0/pmon-v0.1.0-aarch64-pc-windows-msvc.zip",
-            "hash": "REPLACE_WITH_SHA256_FROM_SHA256SUMS",
+            "hash": "0354fbef07064ff99459ff37305e66fb1f3c11fa1dd9e8c8a75e3e1ef8a0d59e",
             "extract_dir": "pmon-v0.1.0-aarch64-pc-windows-msvc"
         }
     },
