@@ -1,8 +1,10 @@
 mod agg;
 mod app;
+mod chart;
 mod completions;
 mod configure;
 mod daemon;
+mod panels;
 mod picker;
 mod sampler;
 mod settings;
@@ -27,7 +29,7 @@ fn duration(s: &str) -> Result<Duration, String> {
 #[command(
     name = "pmon",
     version,
-    after_help = "Display settings: pmon --config (or --style, --charset, --theme, --top)"
+    after_help = "Display settings: pmon --config (or --style, --charset, --theme, --top, --panels, --layout, --focus, --stats, --group)"
 )]
 struct Cli {
     /// Chart one process; opens a picker unless NAME|PID is unambiguous
@@ -46,7 +48,7 @@ struct Cli {
     #[arg(long, value_name = "DURATION", value_parser = duration)]
     agg: Option<Duration>,
 
-    /// Choose graph style, characters, theme and top lines, with a live preview
+    /// Choose panels, layout, style, theme and more, with a live preview
     #[arg(long, conflicts_with_all = ["process", "history", "since", "agg", "daemon", "stop", "status"])]
     config: bool,
 
@@ -59,6 +61,20 @@ struct Cli {
     theme: Option<ThemeName>,
     #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "5", hide = true)]
     top: Option<usize>,
+    #[arg(long, value_name = "LIST", hide = true)]
+    panels: Option<String>,
+    #[arg(long, value_name = "LAYOUT", hide = true)]
+    layout: Option<String>,
+    #[arg(long, value_name = "on|off", hide = true)]
+    stats: Option<String>,
+    #[arg(long, value_name = "on|off", hide = true)]
+    group: Option<String>,
+    #[arg(long, value_name = "PANEL", hide = true)]
+    focus: Option<String>,
+
+    /// Draw below the prompt (ROWS tall) and leave the last frame on screen
+    #[arg(long, value_name = "ROWS", num_args = 0..=1, default_missing_value = "true")]
+    inline: Option<String>,
 
     /// Start the history daemon (samples every 2s)
     #[arg(short, long, conflicts_with_all = ["process", "history", "since", "agg", "stop", "status"])]
@@ -101,12 +117,30 @@ fn visible_command() -> clap::Command {
 }
 
 /// Command-line display flags win over the config file.
-fn overrides(mut s: Settings, cli: &Cli) -> Settings {
+fn overrides(mut s: Settings, cli: &Cli) -> anyhow::Result<Settings> {
     s.style = cli.style.unwrap_or(s.style);
     s.charset = cli.charset.unwrap_or(s.charset);
     s.theme = cli.theme.unwrap_or(s.theme);
     s.top = cli.top.unwrap_or(s.top).min(settings::MAX_TOP);
-    s
+    if let Some(l) = &cli.layout {
+        s.layout = settings::parse_layout(l)?;
+    }
+    if let Some(p) = &cli.panels {
+        s.panels = settings::parse_panels(p)?;
+    }
+    if let Some(v) = &cli.stats {
+        s.stats = settings::parse_bool("--stats", v)?;
+    }
+    if let Some(v) = &cli.focus {
+        s.focus = settings::parse_focus(v)?;
+    }
+    if let Some(v) = &cli.group {
+        s.group = settings::parse_bool("--group", v)?;
+    }
+    if let Some(v) = &cli.inline {
+        s.inline = settings::parse_inline(v)?;
+    }
+    Ok(s)
 }
 
 fn main() {
@@ -140,10 +174,10 @@ fn main() {
             }
         };
         let note = note.or(installed);
-        configure::run(overrides(settings, &cli), note)
+        overrides(settings, &cli).and_then(|s| configure::run(s, note))
     } else {
         Settings::load().and_then(|settings| {
-            let settings = overrides(settings, &cli);
+            let settings = overrides(settings, &cli)?;
             let flash = completions::auto(visible_command());
             app::run(app::Options { history: cli.history, process: cli.process, since: cli.since, agg: cli.agg, settings, flash })
         })

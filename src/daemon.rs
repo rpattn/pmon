@@ -237,23 +237,16 @@ fn run_loop(
         }
 
         let ts_ms = now_ms();
-        let (cpu, mem_used, mem_total) = sampler.system();
+        let (v, mem_total, gpu_mem_total) = sampler.system();
         sampler.refresh_processes(false);
         procs.clear();
         for p in sampler.processes().filter(|p| owned_by(p, user)) {
-            let mut r = ProcRec {
-                ts_ms,
-                start_time: p.start_time(),
-                rss: p.memory(),
-                pid: p.pid().as_u32(),
-                cpu: p.cpu_usage(),
-                name: [0; 32],
-            };
+            let mut r = ProcRec { ts_ms, start_time: p.start_time(), pid: p.pid().as_u32(), v: sampler.metrics(p), name: [0; 32] };
             r.set_name(p.name().as_encoded_bytes());
             procs.push(r);
         }
         let res = sys_ring
-            .append(&[SysRec { ts_ms, cpu, mem_used, mem_total }], &mut buf)
+            .append(&[SysRec { ts_ms, v, mem_total, gpu_mem_total }], &mut buf)
             .and_then(|_| proc_ring.append(&procs, &mut buf));
         if let Err(e) = res {
             eprintln!("pmon: writing history failed: {e}");

@@ -7,6 +7,10 @@ use ratatui::style::Color;
 pub struct Theme {
     pub cpu: Color,
     pub mem: Color,
+    /// Disk read / network receive, and disk write / network send.
+    pub read: Color,
+    pub write: Color,
+    pub gpu: Color,
     /// Borders, axes, labels and other low-key text.
     pub dim: Color,
     /// Picker border and prompts.
@@ -38,6 +42,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Default => Theme {
             cpu: Cyan,
             mem: LightMagenta,
+            read: LightGreen,
+            write: LightRed,
+            gpu: LightBlue,
             dim: DarkGray,
             accent: Yellow,
             warn: Yellow,
@@ -48,6 +55,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Nord => Theme {
             cpu: hex(0x88c0d0),
             mem: hex(0xb48ead),
+            read: hex(0xa3be8c),
+            write: hex(0xd08770),
+            gpu: hex(0x81a1c1),
             dim: hex(0x4c566a),
             accent: hex(0xebcb8b),
             warn: hex(0xebcb8b),
@@ -58,6 +68,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Gruvbox => Theme {
             cpu: hex(0x83a598),
             mem: hex(0xd3869b),
+            read: hex(0xb8bb26),
+            write: hex(0xfe8019),
+            gpu: hex(0x8ec07c),
             dim: hex(0x665c54),
             accent: hex(0xfabd2f),
             warn: hex(0xfabd2f),
@@ -68,6 +81,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Dracula => Theme {
             cpu: hex(0x8be9fd),
             mem: hex(0xff79c6),
+            read: hex(0x50fa7b),
+            write: hex(0xffb86c),
+            gpu: hex(0xbd93f9),
             dim: hex(0x6272a4),
             accent: hex(0xf1fa8c),
             warn: hex(0xf1fa8c),
@@ -78,6 +94,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Solarized => Theme {
             cpu: hex(0x2aa198),
             mem: hex(0xd33682),
+            read: hex(0x859900),
+            write: hex(0xcb4b16),
+            gpu: hex(0x268bd2),
             dim: hex(0x657b83),
             accent: hex(0xb58900),
             warn: hex(0xb58900),
@@ -88,6 +107,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Light => Theme {
             cpu: hex(0x0060a0),
             mem: hex(0xa0007a),
+            read: hex(0x1a7f37),
+            write: hex(0xbc4c00),
+            gpu: hex(0x8250df),
             dim: hex(0x909090),
             accent: hex(0x9a6700),
             warn: hex(0x9a6700),
@@ -98,6 +120,9 @@ pub fn theme(name: ThemeName) -> Theme {
         ThemeName::Mono => Theme {
             cpu: Reset,
             mem: Reset,
+            read: Reset,
+            write: Reset,
+            gpu: Reset,
             dim: Reset,
             accent: Reset,
             warn: Reset,

@@ -225,12 +225,16 @@ pub fn auto(mut cmd: Command) -> Option<String> {
     }
     if let Some(path) = drop_in(shell) {
         let current = format!("installed {VERSION}");
-        match known.as_deref() {
-            Some(_) if !path.exists() => return None, // the user removed it
-            Some(k) if k == current => return None,
-            _ => {}
+        if known.is_some() && !path.exists() {
+            return None; // the user removed it
         }
-        write_atomic(&path, &script(shell, &mut cmd)).ok()?;
+        // Compare contents rather than versions, so new flags show up even
+        // between releases.
+        let fresh = script(shell, &mut cmd);
+        if known.is_some() && fs::read(&path).is_ok_and(|old| old == fresh) {
+            return None;
+        }
+        write_atomic(&path, &fresh).ok()?;
         state.insert(key, current);
         save_state(&state);
         let done = if known.is_some() { "updated" } else { "installed" };

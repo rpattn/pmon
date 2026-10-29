@@ -10,6 +10,92 @@ use std::path::PathBuf;
 
 pub const DEFAULT_TOP: usize = 5;
 pub const MAX_TOP: usize = 8;
+/// Rows used by `--inline` when no height is given.
+pub const DEFAULT_INLINE: u16 = 24;
+
+/// The charts pmon can show, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ValueEnum)]
+pub enum PanelKind {
+    Cpu,
+    #[value(alias = "mem")]
+    Ram,
+    Disk,
+    #[value(alias = "network")]
+    Net,
+    Gpu,
+}
+
+impl PanelKind {
+    pub const ALL: [PanelKind; 5] = [PanelKind::Cpu, PanelKind::Ram, PanelKind::Disk, PanelKind::Net, PanelKind::Gpu];
+}
+
+/// How panels are arranged: a preset, or rows of panels from a template
+/// such as `cpu / ram disk / net gpu`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Arrangement {
+    Preset(LayoutKind),
+    Rows(Vec<Vec<PanelKind>>),
+}
+
+impl Arrangement {
+    /// The config-file spelling: a preset name or the template.
+    pub fn text(&self) -> String {
+        match self {
+            Arrangement::Preset(k) => name(k),
+            Arrangement::Rows(rows) => {
+                rows.iter().map(|r| r.iter().map(name).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" / ")
+            }
+        }
+    }
+
+    /// The next (or previous) choice: the presets, plus `custom` if there is one.
+    pub fn step(&self, custom: Option<&Arrangement>, by: isize) -> Arrangement {
+        let mut all: Vec<Arrangement> = custom.into_iter().cloned().collect();
+        all.extend(LayoutKind::value_variants().iter().map(|k| Arrangement::Preset(*k)));
+        let i = all.iter().position(|a| a == self).unwrap_or(0) as isize;
+        all[(i + by).rem_euclid(all.len() as isize) as usize].clone()
+    }
+}
+
+/// A preset name, or a template: rows split by `/`, panels in a row split by
+/// spaces or commas, each panel at most once.
+pub fn parse_layout(v: &str) -> Result<Arrangement> {
+    if let Ok(k) = LayoutKind::from_str(v.trim(), true) {
+        return Ok(Arrangement::Preset(k));
+    }
+    let mut seen = Vec::new();
+    let mut rows = Vec::new();
+    for row in v.split('/') {
+        let mut panels = Vec::new();
+        for word in row.split(|c: char| c == ',' || c.is_whitespace()).filter(|w| !w.is_empty()) {
+            let p: PanelKind = parse_enum("panel", word)?;
+            if seen.contains(&p) {
+                bail!("`{word}` appears twice in the layout");
+            }
+            seen.push(p);
+            panels.push(p);
+        }
+        if !panels.is_empty() {
+            rows.push(panels);
+        }
+    }
+    if rows.is_empty() {
+        bail!("layout must be auto, rows, columns, grid, or rows of panels like \"cpu / ram disk / net gpu\"");
+    }
+    Ok(Arrangement::Rows(rows))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LayoutKind {
+    /// Stacked when there's room, otherwise a grid.
+    Auto,
+    /// One above the other.
+    Rows,
+    /// Side by side.
+    Columns,
+    /// Two columns.
+    Grid,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum GraphStyle {
@@ -104,6 +190,20 @@ pub struct Settings {
     pub theme: ThemeName,
     /// Top-process lines in the system view; 0 = off.
     pub top: usize,
+    /// Panels to show (in `PanelKind` order).
+    pub panels: Vec<PanelKind>,
+    pub layout: Arrangement,
+    /// In a grid with an odd number of panels, the one given the full-width
+    /// top row (`None`: the last panel spans the bottom row instead).
+    pub focus: Option<PanelKind>,
+    /// A stats box (now/avg/peak and top consumers) beside each chart.
+    pub stats: bool,
+    /// Draw below the prompt in this many rows and leave the last frame on
+    /// screen after exiting, instead of taking over the whole terminal.
+    pub inline: Option<u16>,
+    /// Combine processes with the same name (a browser's many processes)
+    /// into one app in lists, top lines and the picker.
+    pub group: bool,
 }
 
 impl Default for Settings {
@@ -114,6 +214,12 @@ impl Default for Settings {
             charset: Charset::Braille,
             theme: if no_color { ThemeName::Mono } else { ThemeName::Default },
             top: 0,
+            panels: PanelKind::ALL.to_vec(),
+            layout: Arrangement::Preset(LayoutKind::Auto),
+            focus: Some(PanelKind::Cpu),
+            stats: true,
+            inline: None,
+            group: true,
         }
     }
 }
@@ -149,6 +255,52 @@ pub fn config_path() -> PathBuf {
         PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into())).join(".config")
     });
     base.join("pmon").join("config.toml")
+}
+
+/// A panel name, or `none`.
+pub fn parse_focus(v: &str) -> Result<Option<PanelKind>> {
+    if v.trim().eq_ignore_ascii_case("none") { Ok(None) } else { parse_enum("focus panel", v.trim()).map(Some) }
+}
+
+pub fn focus_str(f: Option<PanelKind>) -> String {
+    f.map_or("none".into(), |k| name(&k))
+}
+
+/// A comma-separated list of panel names; empty means none.
+pub fn parse_panels(v: &str) -> Result<Vec<PanelKind>> {
+    let mut out = v
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| parse_enum::<PanelKind>("panel", p))
+        .collect::<Result<Vec<_>>>()?;
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+pub fn panels_str(panels: &[PanelKind]) -> String {
+    panels.iter().map(name).collect::<Vec<_>>().join(",")
+}
+
+pub fn parse_bool(key: &str, v: &str) -> Result<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => bail!("{key} must be true or false"),
+    }
+}
+
+/// `false`, `true` (default height) or a number of rows.
+pub fn parse_inline(v: &str) -> Result<Option<u16>> {
+    match v.to_ascii_lowercase().as_str() {
+        "false" | "no" | "off" | "0" => Ok(None),
+        "true" | "yes" | "on" => Ok(Some(DEFAULT_INLINE)),
+        n => n
+            .parse::<u16>()
+            .map(|n| Some(n.max(8)))
+            .map_err(|_| anyhow::anyhow!("inline must be true, false or a number of rows")),
+    }
 }
 
 fn parse_enum<T: ValueEnum>(key: &str, v: &str) -> Result<T> {
@@ -190,7 +342,15 @@ impl Settings {
                     .parse::<usize>()
                     .map(|v| self.top = v.min(MAX_TOP))
                     .map_err(|_| anyhow::anyhow!("top must be a number 0-{MAX_TOP}")),
-                _ => Err(anyhow::anyhow!("unknown setting `{key}` (expected style, charset, theme or top)")),
+                "panels" => parse_panels(value).map(|v| self.panels = v),
+                "layout" => parse_layout(value).map(|v| self.layout = v),
+                "focus" => parse_focus(value).map(|v| self.focus = v),
+                "stats" => parse_bool(key, value).map(|v| self.stats = v),
+                "inline" => parse_inline(value).map(|v| self.inline = v),
+                "group" => parse_bool(key, value).map(|v| self.group = v),
+                _ => Err(anyhow::anyhow!(
+                    "unknown setting `{key}` (expected style, charset, theme, top, panels, layout, focus, stats, inline or group)"
+                )),
             };
             res.with_context(|| format!("line {}", n + 1))?;
         }
@@ -210,6 +370,15 @@ impl Settings {
             ),
             (format!("theme = \"{}\"", name(&self.theme)), "default, nord, gruvbox, dracula, solarized, light, mono".to_string()),
             (format!("top = {}", self.top), format!("top-process lines in the system view, 0 = off (max {MAX_TOP})")),
+            (format!("panels = \"{}\"", panels_str(&self.panels)), "any of cpu, ram, disk, net, gpu".to_string()),
+            (format!("layout = \"{}\"", self.layout.text()), "auto, rows, columns, grid, or e.g. \"cpu / ram disk / net gpu\"".to_string()),
+            (format!("focus = \"{}\"", focus_str(self.focus)), "panel given the full-width row in an odd grid, or none".to_string()),
+            (format!("stats = {}", self.stats), "now/avg/peak and top consumers beside each chart".to_string()),
+            (
+                format!("inline = {}", self.inline.map_or("false".to_string(), |n| n.to_string())),
+                "draw below the prompt in N rows and leave it on screen; false = full screen".to_string(),
+            ),
+            (format!("group = {}", self.group), "combine processes with the same name into one app".to_string()),
         ];
         let mut text = String::from("# pmon display defaults (written by `pmon --config` or `w` in pmon)\n");
         for (line, comment) in rows {
@@ -226,9 +395,20 @@ mod tests {
 
     #[test]
     fn round_trips_config() {
-        let s = Settings { style: GraphStyle::Area, charset: Charset::HalfBlock, theme: ThemeName::Nord, top: 3 };
+        let s = Settings {
+            style: GraphStyle::Area,
+            charset: Charset::HalfBlock,
+            theme: ThemeName::Nord,
+            top: 3,
+            panels: vec![PanelKind::Cpu, PanelKind::Net],
+            layout: Arrangement::Preset(LayoutKind::Grid),
+            focus: Some(PanelKind::Cpu),
+            stats: false,
+            inline: Some(30),
+            group: true,
+        };
         let text = format!(
-            "style = \"{}\"\ncharset = {} # comment\n\n theme=\"{}\"\ntop = 3\n",
+            "style = \"{}\"\ncharset = {} # comment\n\n theme=\"{}\"\ntop = 3\npanels = \"network, cpu\"\nlayout = grid\nstats = off\ninline = 30\n",
             name(&s.style),
             name(&s.charset),
             name(&s.theme)
@@ -243,5 +423,47 @@ mod tests {
         let err = Settings::default().apply("theme = \"neon\"").unwrap_err();
         assert!(format!("{err:#}").contains("expected one of"));
         assert!(Settings::default().apply("colour = red").is_err());
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn saved_file_loads_back() {
+        let dir = std::env::temp_dir().join(format!("pmon-settings-{}", std::process::id()));
+        let s = Settings { panels: vec![PanelKind::Ram, PanelKind::Gpu], inline: Some(20), stats: false, ..Settings::default() };
+        // save() writes to config_path(); exercise the same text via apply.
+        let rows = format!("panels = \"{}\"\ninline = 20\nstats = false\n", panels_str(&s.panels));
+        let mut got = Settings::default();
+        got.apply(&rows).unwrap();
+        assert_eq!((got.panels, got.inline, got.stats), (s.panels, s.inline, s.stats));
+        assert_eq!(parse_inline("true").unwrap(), Some(DEFAULT_INLINE));
+        assert!(parse_panels("cpu,toaster").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use PanelKind::*;
+
+    #[test]
+    fn parses_templates_and_presets() {
+        assert_eq!(parse_layout("Grid").unwrap(), Arrangement::Preset(LayoutKind::Grid));
+        let a = parse_layout(" cpu / ram,disk / net  gpu ").unwrap();
+        assert_eq!(a, Arrangement::Rows(vec![vec![Cpu], vec![Ram, Disk], vec![Net, Gpu]]));
+        assert_eq!(a.text(), "cpu / ram disk / net gpu");
+        assert_eq!(parse_layout(&a.text()).unwrap(), a);
+        assert!(parse_layout("cpu / cpu").is_err());
+        assert!(parse_layout("cpu / toaster").is_err());
+        assert!(parse_layout(" / ").is_err());
+        // Cycling: the custom template, then the presets.
+        let auto = Arrangement::Preset(LayoutKind::Auto);
+        assert_eq!(a.step(Some(&a), 1), auto);
+        assert_eq!(auto.step(Some(&a), -1), a);
+        assert_eq!(Arrangement::Preset(LayoutKind::Grid).step(None, 1), auto);
     }
 }

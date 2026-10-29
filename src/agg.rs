@@ -2,11 +2,29 @@
 
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug)]
+/// Indices into [`Point::v`].
+pub const CPU: usize = 0;
+pub const MEM: usize = 1;
+pub const DISK_R: usize = 2;
+pub const DISK_W: usize = 3;
+pub const NET_RX: usize = 4;
+pub const NET_TX: usize = 5;
+pub const GPU: usize = 6;
+pub const GPU_MEM: usize = 7;
+pub const METRICS: usize = 8;
+
+/// One sample of every metric: CPU %, memory bytes, disk and network
+/// bytes/s, GPU % and GPU memory bytes. Unavailable metrics are 0.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Point {
     pub ts_ms: u64,
-    pub cpu: f64,
-    pub mem: f64,
+    pub v: [f64; METRICS],
+}
+
+impl Point {
+    pub fn new(ts_ms: u64, v: [f64; METRICS]) -> Self {
+        Point { ts_ms, v }
+    }
 }
 
 /// Chart series: `(seconds relative to now, value)`.
@@ -31,42 +49,59 @@ pub fn auto_bucket(range: Duration, cols: u16, interval: Duration) -> Duration {
 /// starts a run (the first, or after missing buckets) also gets a point at
 /// its first sample, so a new series begins where its data begins instead of
 /// one whole bucket earlier, and grows from there.
-pub fn aggregate(pts: &[Point], now_ms: u64, range: Duration, bucket: Duration) -> (Xy, Xy) {
+pub fn aggregate(pts: &[Point], now_ms: u64, range: Duration, bucket: Duration) -> [Xy; METRICS] {
     let start = now_ms.saturating_sub(range.as_millis() as u64);
     let b = (bucket.as_millis() as u64).max(1);
     let first = pts.partition_point(|p| p.ts_ms < start);
-    let (mut cpu, mut mem) = (Vec::new(), Vec::new());
+    let mut out: [Xy; METRICS] = Default::default();
     let rel = |ts: u64| (ts.min(now_ms) as f64 - now_ms as f64) / 1000.0;
     let mut last_id: Option<u64> = None;
-    let mut emit = |id: u64, first_ts: u64, c: f64, m: f64| {
+    let mut emit = |id: u64, first_ts: u64, v: &[f64; METRICS]| {
         let end = rel((id + 1) * b);
         let start = rel(first_ts);
-        if last_id.is_none_or(|l| l + 1 != id) && start < end {
-            cpu.push((start, c));
-            mem.push((start, m));
+        let lead = last_id.is_none_or(|l| l + 1 != id) && start < end;
+        for (series, &y) in out.iter_mut().zip(v) {
+            if lead {
+                series.push((start, y));
+            }
+            series.push((end, y));
         }
-        cpu.push((end, c));
-        mem.push((end, m));
         last_id = Some(id);
     };
-    // (bucket id, first sample's ts, max cpu, max mem)
-    let mut cur: Option<(u64, u64, f64, f64)> = None;
+    // (bucket id, first sample's ts, per-metric max)
+    let mut cur: Option<(u64, u64, [f64; METRICS])> = None;
     for p in &pts[first..] {
         let id = p.ts_ms / b;
         cur = match cur {
-            Some((cid, t0, c, m)) if cid == id => Some((cid, t0, c.max(p.cpu), m.max(p.mem))),
-            prev => {
-                if let Some((cid, t0, c, m)) = prev {
-                    emit(cid, t0, c, m);
+            Some((cid, t0, mut v)) if cid == id => {
+                for (m, &x) in v.iter_mut().zip(&p.v) {
+                    *m = m.max(x);
                 }
-                Some((id, p.ts_ms, p.cpu, p.mem))
+                Some((cid, t0, v))
+            }
+            prev => {
+                if let Some((cid, t0, v)) = prev {
+                    emit(cid, t0, &v);
+                }
+                Some((id, p.ts_ms, p.v))
             }
         };
     }
-    if let Some((cid, t0, c, m)) = cur {
-        emit(cid, t0, c, m);
+    if let Some((cid, t0, v)) = cur {
+        emit(cid, t0, &v);
     }
-    (cpu, mem)
+    out
+}
+
+/// Mean and maximum of one metric over the points at or after `start_ms`.
+pub fn mean_max(pts: &[Point], start_ms: u64, metric: usize) -> Option<(f64, f64)> {
+    let pts = &pts[pts.partition_point(|p| p.ts_ms < start_ms)..];
+    if pts.is_empty() {
+        return None;
+    }
+    let sum: f64 = pts.iter().map(|p| p.v[metric]).sum();
+    let max = pts.iter().map(|p| p.v[metric]).fold(0.0, f64::max);
+    Some((sum / pts.len() as f64, max))
 }
 
 #[cfg(test)]
@@ -85,19 +120,26 @@ mod tests {
     fn takes_max_per_bucket() {
         let pts: Vec<Point> = [(1000, 10.0), (2000, 90.0), (3000, 20.0), (6000, 5.0)]
             .iter()
-            .map(|&(ts_ms, cpu)| Point { ts_ms, cpu, mem: cpu * 2.0 })
+            .map(|&(ts_ms, cpu)| {
+                let mut v = [0.0; METRICS];
+                v[CPU] = cpu;
+                v[MEM] = cpu * 2.0;
+                Point::new(ts_ms, v)
+            })
             .collect();
-        let (cpu, mem) = aggregate(&pts, 10_000, Duration::from_secs(10), Duration::from_secs(5));
+        let out = aggregate(&pts, 10_000, Duration::from_secs(10), Duration::from_secs(5));
         // The first bucket also gets a point at its first sample (t=1s).
-        assert_eq!(cpu, vec![(-9.0, 90.0), (-5.0, 90.0), (0.0, 5.0)]);
-        assert_eq!(mem[0].1, 180.0);
+        assert_eq!(out[CPU], vec![(-9.0, 90.0), (-5.0, 90.0), (0.0, 5.0)]);
+        assert_eq!(out[MEM][0].1, 180.0);
+        assert_eq!(mean_max(&pts, 2000, CPU), Some((115.0 / 3.0, 90.0)));
     }
 
     #[test]
     fn open_bucket_spans_from_first_sample_to_now() {
         // One sample 0.3s ago in a 2s bucket that is still open.
-        let pts = [Point { ts_ms: 9_700, cpu: 7.0, mem: 1.0 }];
-        let (cpu, _) = aggregate(&pts, 10_000, Duration::from_secs(120), Duration::from_secs(2));
-        assert_eq!(cpu, vec![(-0.3, 7.0), (0.0, 7.0)]);
+        let mut v = [0.0; METRICS];
+        v[CPU] = 7.0;
+        let out = aggregate(&[Point::new(9_700, v)], 10_000, Duration::from_secs(120), Duration::from_secs(2));
+        assert_eq!(out[CPU], vec![(-0.3, 7.0), (0.0, 7.0)]);
     }
 }

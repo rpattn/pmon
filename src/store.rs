@@ -18,6 +18,7 @@
 //! reading: anything with an index below `begin_count - capacity` (re-read after
 //! the data) is discarded.
 
+use crate::agg::{self, METRICS};
 use anyhow::{Context, Result, bail};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -28,7 +29,7 @@ pub const SYS_FILE: &str = "system.ring";
 pub const PROC_FILE: &str = "procs.ring";
 
 const MAGIC: &[u8; 8] = b"PMONRING";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_LEN: u64 = 64;
 const OFF_BEGIN: u64 = 24;
 
@@ -108,25 +109,25 @@ pub trait Record: Copy {
     fn ts_ms(&self) -> u64;
 }
 
-/// One system-wide sample.
+/// One system-wide sample: every metric (see `agg`), plus the totals that
+/// scale the memory charts.
 #[derive(Clone, Copy, Debug)]
 pub struct SysRec {
     pub ts_ms: u64,
-    pub cpu: f32,
-    pub mem_used: u64,
+    pub v: [f64; METRICS],
     pub mem_total: u64,
+    pub gpu_mem_total: u64,
 }
 
 /// One sample of one process. Processes are keyed by `(pid, start_time)` so a
-/// reused pid never merges with an earlier process.
+/// reused pid never merges with an earlier process. CPU is % of one core
+/// (top-style; may exceed 100); there is no per-process network.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcRec {
     pub ts_ms: u64,
     pub start_time: u64,
-    pub rss: u64,
     pub pid: u32,
-    /// Percent of one core (top-style; may exceed 100).
-    pub cpu: f32,
+    pub v: [f64; METRICS],
     pub name: [u8; 32],
 }
 
@@ -154,16 +155,31 @@ fn f32_at(b: &[u8], o: usize) -> f32 {
 }
 
 impl Record for SysRec {
-    const SIZE: usize = 32;
+    // ts | cpu f32 | gpu f32 | mem u64 | mem_total u64 | disk r/w, net rx/tx f32 | gpu_mem u64 | gpu_mem_total u64
+    const SIZE: usize = 64;
     fn encode(&self, o: &mut [u8]) {
+        let v = &self.v;
         o[0..8].copy_from_slice(&self.ts_ms.to_le_bytes());
-        o[8..12].copy_from_slice(&self.cpu.to_le_bytes());
-        o[12..16].fill(0);
-        o[16..24].copy_from_slice(&self.mem_used.to_le_bytes());
+        o[8..12].copy_from_slice(&(v[agg::CPU] as f32).to_le_bytes());
+        o[12..16].copy_from_slice(&(v[agg::GPU] as f32).to_le_bytes());
+        o[16..24].copy_from_slice(&(v[agg::MEM] as u64).to_le_bytes());
         o[24..32].copy_from_slice(&self.mem_total.to_le_bytes());
+        for (k, m) in [agg::DISK_R, agg::DISK_W, agg::NET_RX, agg::NET_TX].into_iter().enumerate() {
+            o[32 + 4 * k..36 + 4 * k].copy_from_slice(&(v[m] as f32).to_le_bytes());
+        }
+        o[48..56].copy_from_slice(&(v[agg::GPU_MEM] as u64).to_le_bytes());
+        o[56..64].copy_from_slice(&self.gpu_mem_total.to_le_bytes());
     }
     fn decode(b: &[u8]) -> Self {
-        SysRec { ts_ms: u64_at(b, 0), cpu: f32_at(b, 8), mem_used: u64_at(b, 16), mem_total: u64_at(b, 24) }
+        let mut v = [0.0; METRICS];
+        v[agg::CPU] = f32_at(b, 8) as f64;
+        v[agg::GPU] = f32_at(b, 12) as f64;
+        v[agg::MEM] = u64_at(b, 16) as f64;
+        for (k, m) in [agg::DISK_R, agg::DISK_W, agg::NET_RX, agg::NET_TX].into_iter().enumerate() {
+            v[m] = f32_at(b, 32 + 4 * k) as f64;
+        }
+        v[agg::GPU_MEM] = u64_at(b, 48) as f64;
+        SysRec { ts_ms: u64_at(b, 0), v, mem_total: u64_at(b, 24), gpu_mem_total: u64_at(b, 56) }
     }
     fn ts_ms(&self) -> u64 {
         self.ts_ms
@@ -171,24 +187,28 @@ impl Record for SysRec {
 }
 
 impl Record for ProcRec {
-    const SIZE: usize = 64;
+    // ts | start u64 | rss u64 | pid u32 | cpu, disk r/w, gpu f32 | gpu_mem KiB u32 | name [u8; 32]
+    const SIZE: usize = 80;
     fn encode(&self, o: &mut [u8]) {
+        let v = &self.v;
         o[0..8].copy_from_slice(&self.ts_ms.to_le_bytes());
         o[8..16].copy_from_slice(&self.start_time.to_le_bytes());
-        o[16..24].copy_from_slice(&self.rss.to_le_bytes());
+        o[16..24].copy_from_slice(&(v[agg::MEM] as u64).to_le_bytes());
         o[24..28].copy_from_slice(&self.pid.to_le_bytes());
-        o[28..32].copy_from_slice(&self.cpu.to_le_bytes());
-        o[32..64].copy_from_slice(&self.name);
+        for (k, m) in [agg::CPU, agg::DISK_R, agg::DISK_W, agg::GPU].into_iter().enumerate() {
+            o[28 + 4 * k..32 + 4 * k].copy_from_slice(&(v[m] as f32).to_le_bytes());
+        }
+        o[44..48].copy_from_slice(&((v[agg::GPU_MEM] / 1024.0) as u32).to_le_bytes());
+        o[48..80].copy_from_slice(&self.name);
     }
     fn decode(b: &[u8]) -> Self {
-        ProcRec {
-            ts_ms: u64_at(b, 0),
-            start_time: u64_at(b, 8),
-            rss: u64_at(b, 16),
-            pid: u32_at(b, 24),
-            cpu: f32_at(b, 28),
-            name: b[32..64].try_into().unwrap(),
+        let mut v = [0.0; METRICS];
+        v[agg::MEM] = u64_at(b, 16) as f64;
+        for (k, m) in [agg::CPU, agg::DISK_R, agg::DISK_W, agg::GPU].into_iter().enumerate() {
+            v[m] = f32_at(b, 28 + 4 * k) as f64;
         }
+        v[agg::GPU_MEM] = u32_at(b, 44) as f64 * 1024.0;
+        ProcRec { ts_ms: u64_at(b, 0), start_time: u64_at(b, 8), pid: u32_at(b, 24), v, name: b[48..80].try_into().unwrap() }
     }
     fn ts_ms(&self) -> u64 {
         self.ts_ms
@@ -371,5 +391,34 @@ impl<R: Record> Ring<R> {
         // Skip the oldest slot: it is the next one to be overwritten.
         let oldest = end.saturating_sub(self.cap - 1).min(end - 1);
         Ok(Some((ts_at(oldest)?, ts_at(end - 1)?)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_round_trip() {
+        let mut v = [0.0; METRICS];
+        v[agg::CPU] = 12.5;
+        v[agg::MEM] = 3.0e9;
+        v[agg::DISK_R] = 1024.0;
+        v[agg::NET_TX] = 2048.0;
+        v[agg::GPU] = 40.0;
+        v[agg::GPU_MEM] = 8.0 * 1024.0 * 1024.0;
+        let s = SysRec { ts_ms: 42, v, mem_total: 16, gpu_mem_total: 8 };
+        let mut buf = [0u8; SysRec::SIZE];
+        s.encode(&mut buf);
+        let d = SysRec::decode(&buf);
+        assert_eq!((d.ts_ms, d.v, d.mem_total, d.gpu_mem_total), (42, v, 16, 8));
+
+        v[agg::NET_TX] = 0.0; // not recorded per process
+        let mut p = ProcRec { ts_ms: 7, start_time: 9, pid: 3, v, name: [0; 32] };
+        p.set_name(b"firefox");
+        let mut buf = [0u8; ProcRec::SIZE];
+        p.encode(&mut buf);
+        let d = ProcRec::decode(&buf);
+        assert_eq!((d.ts_ms, d.start_time, d.pid, d.v, d.name_str()), (7, 9, 3, v, "firefox".to_string()));
     }
 }
