@@ -1,5 +1,6 @@
 mod agg;
 mod app;
+mod completions;
 mod configure;
 mod daemon;
 mod picker;
@@ -83,6 +84,20 @@ struct Cli {
     /// are left out of the script, so `--c<TAB>` completes to `--config`.
     #[arg(long, value_name = "SHELL", hide = true, exclusive = true)]
     completions: Option<clap_complete::Shell>,
+
+    /// Set up Tab completion now (normally automatic on first run).
+    #[arg(long, value_name = "SHELL", hide = true, exclusive = true, num_args = 0..=1)]
+    install_completions: Option<Option<clap_complete::Shell>>,
+}
+
+/// The command without hidden flags; completion generators include hidden
+/// flags, which would make `--c<Tab>` ambiguous.
+fn visible_command() -> clap::Command {
+    let full = Cli::command();
+    clap::Command::new("pmon")
+        .about(full.get_about().cloned().unwrap_or_default())
+        .version(env!("CARGO_PKG_VERSION"))
+        .args(full.get_arguments().filter(|a| !a.is_hide_set()).cloned())
 }
 
 /// Command-line display flags win over the config file.
@@ -102,22 +117,19 @@ fn main() {
     }
     let cli = Cli::parse();
     if let Some(shell) = cli.completions {
-        // Generators include hidden flags, so build a copy without them.
-        let full = Cli::command();
-        let mut visible = clap::Command::new("pmon")
-            .about(full.get_about().cloned().unwrap_or_default())
-            .version(env!("CARGO_PKG_VERSION"))
-            .args(full.get_arguments().filter(|a| !a.is_hide_set()).cloned());
-        clap_complete::generate(shell, &mut visible, "pmon", &mut std::io::stdout());
+        clap_complete::generate(shell, &mut visible_command(), "pmon", &mut std::io::stdout());
         return;
     }
-    let res = if cli.stop {
+    let res = if let Some(shell) = cli.install_completions {
+        completions::install(shell, visible_command())
+    } else if cli.stop {
         daemon::stop()
     } else if cli.status {
         daemon::status()
     } else if cli.daemon {
         daemon::start(cli.retain.unwrap_or(daemon::DEFAULT_RETAIN), cli.foreground)
     } else if cli.config {
+        let installed = completions::auto(visible_command());
         // A broken config file shouldn't lock you out of the tool that fixes it.
         let (settings, note) = match Settings::load() {
             Ok(s) => (s, None),
@@ -127,11 +139,13 @@ fn main() {
                 (Settings::default(), Some(format!("config.toml: {cause}; saving replaces it")))
             }
         };
+        let note = note.or(installed);
         configure::run(overrides(settings, &cli), note)
     } else {
         Settings::load().and_then(|settings| {
             let settings = overrides(settings, &cli);
-            app::run(app::Options { history: cli.history, process: cli.process, since: cli.since, agg: cli.agg, settings })
+            let flash = completions::auto(visible_command());
+            app::run(app::Options { history: cli.history, process: cli.process, since: cli.since, agg: cli.agg, settings, flash })
         })
     };
     std::process::exit(match res {

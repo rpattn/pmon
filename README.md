@@ -56,26 +56,21 @@ MSVC linker); everything else is pure Rust.
 
 ### Shell completion
 
-`pmon --completions <bash|zsh|fish|powershell|elvish>` prints a completion
-script, so `pmon --c<Tab>` completes to `--config`. Install it once:
+Tab completion sets itself up the first time you run pmon interactively, so
+`pmon --c<Tab>` completes to `--config` with no setup:
 
-```bash
-# bash
-mkdir -p ~/.local/share/bash-completion/completions
-pmon --completions bash > ~/.local/share/bash-completion/completions/pmon
-# zsh (any directory on your $fpath)
-pmon --completions zsh > ~/.zfunc/_pmon
-# fish
-pmon --completions fish > ~/.config/fish/completions/pmon.fish
-```
+- **bash** (with bash-completion, the default on most distros), **fish**, and
+  **zsh with oh-my-zsh** load completion scripts from a directory. pmon writes
+  its script there silently and refreshes it when pmon is updated.
+- **Plain zsh, PowerShell, elvish** (and bash without bash-completion) need a
+  line in a startup file (`~/.zshrc`, `$PROFILE`, …). pmon asks once
+  (`[Y/n]`) before adding it and remembers the answer.
 
-```powershell
-# PowerShell: add to your profile
-pmon --completions powershell | Out-String | Invoke-Expression
-```
-
-Open a new shell afterwards. Display flags (`--style` etc.) are deliberately
-not completed; use `--config` instead.
+It only happens for the TUI and `--config`, never for the daemon or scripts.
+If you delete the installed script, pmon leaves it deleted. To opt out, set
+`PMON_NO_COMPLETIONS=1`. To set it up later (e.g. after answering no), run
+`pmon --install-completions [bash|zsh|fish|powershell|elvish]`, or print the
+script yourself with `pmon --completions <shell>`. Open a new shell afterwards.
 
 ## Usage
 

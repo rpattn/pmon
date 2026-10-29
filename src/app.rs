@@ -34,6 +34,8 @@ pub struct Options {
     pub since: Option<Duration>,
     pub agg: Option<Duration>,
     pub settings: Settings,
+    /// A message to show briefly in the status line at start-up.
+    pub flash: Option<String>,
 }
 
 #[derive(Default)]
@@ -137,7 +139,7 @@ pub fn run(opts: Options) -> Result<i32> {
         proc: None,
         picker: None,
         note: None,
-        flash: None,
+        flash: opts.flash.map(|m| (m, Instant::now())),
         quit: false,
         theme: theme(opts.settings.theme),
         top_last: if opts.settings.top > 0 { opts.settings.top } else { DEFAULT_TOP },
